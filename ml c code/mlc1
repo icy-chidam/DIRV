@@ -1,0 +1,282 @@
+// radar_classifier_with_ranges.c
+// C port of the range/velocity/SNR-based classification logic from Python
+// Focus: inference/labeling using explicit class ranges and scoring
+// Compile: gcc -O2 -o radar_classifier radar_classifier_with_ranges.c -lm
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+#define MAX_LINE 4096
+#define MAX_COLS 128
+#define MAX_ROWS 200000
+
+typedef struct {
+    double range_min, range_max;
+    double velocity_min, velocity_max;
+    double snr_min, snr_max;
+    double height_min, height_max;
+    double probability;
+    char color[16];
+    char description[128];
+    char name[32];
+} ClassRange;
+
+typedef struct {
+    // input fields
+    double x, y, range, velocity, snr, height, intensity, azimuth;
+    // output
+    char object_type[32];
+    double classification_confidence;
+    double range_match_score;
+    double velocity_match_score;
+    double snr_match_score;
+} Sample;
+
+ClassRange classes[3];
+
+void init_classes() {
+    strcpy(classes[0].name, "vehicle");
+    classes[0].range_min = 2.0; classes[0].range_max = 50.0;
+    classes[0].velocity_min = 5.0; classes[0].velocity_max = 25.0;
+    classes[0].snr_min = 25.0; classes[0].snr_max = 70.0;
+    classes[0].height_min = 1.2; classes[0].height_max = 1.8;
+    classes[0].probability = 0.50;
+    strcpy(classes[0].description, "Cars, SUVs, vans, trucks");
+
+    strcpy(classes[1].name, "pedestrian");
+    classes[1].range_min = 0.5; classes[1].range_max = 30.0;
+    classes[1].velocity_min = 0.3; classes[1].velocity_max = 2.0;
+    classes[1].snr_min = 12.0; classes[1].snr_max = 45.0;
+    classes[1].height_min = 1.5; classes[1].height_max = 1.9;
+    classes[1].probability = 0.30;
+    strcpy(classes[1].description, "Walking people");
+
+    strcpy(classes[2].name, "static_object");
+    classes[2].range_min = 0.2; classes[2].range_max = 60.0;
+    classes[2].velocity_min = -0.1; classes[2].velocity_max = 0.1;
+    classes[2].snr_min = 5.0; classes[2].snr_max = 60.0;
+    classes[2].height_min = 0.1; classes[2].height_max = 6.0;
+    classes[2].probability = 0.20;
+    strcpy(classes[2].description, "Poles, signs, barriers, stationary objects");
+}
+
+// center-biased match score (identical to python _calculate_match_score)
+double match_score(double value, double min_val, double max_val) {
+    if (value < min_val || value > max_val) return 0.0;
+    if (max_val - min_val == 0.0) return 1.0;
+    double normalized = (value - min_val) / (max_val - min_val);
+    return 1.0 - fabs(normalized - 0.5) * 2.0;
+}
+
+// safe parsing helpers
+double to_double_or_default(const char* s, double def) {
+    if (!s || strlen(s)==0) return def;
+    char *end; double v = strtod(s, &end);
+    if (end == s) return def;
+    return v;
+}
+
+// CSV utility: find column index by name
+int find_col(char *headers[], int ncols, const char *name) {
+    for (int i=0;i<ncols;i++) {
+        if (strcasecmp(headers[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+// Read CSV into Sample array. Accepts missing columns and fills sensible defaults.
+int load_csv(const char *path, Sample *samples, int max_samples) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open %s\n", path);
+        return -1;
+    }
+    char line[MAX_LINE];
+    // read header
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+    // tokenize header
+    char *headers[MAX_COLS];
+    int ncols = 0;
+    char *p = strtok(line, ",\n\r");
+    while (p && ncols < MAX_COLS) {
+        // trim
+        while (*p == ' ') p++;
+        headers[ncols++] = strdup(p);
+        p = strtok(NULL, ",\n\r");
+    }
+    // find indexes
+    int idx_x = find_col(headers, ncols, "x");
+    int idx_y = find_col(headers, ncols, "y");
+    int idx_range = find_col(headers, ncols, "range");
+    int idx_vel = find_col(headers, ncols, "velocity");
+    int idx_snr = find_col(headers, ncols, "snr");
+    int idx_height = find_col(headers, ncols, "height");
+    int idx_int = find_col(headers, ncols, "intensity");
+    int idx_az = find_col(headers, ncols, "azimuth");
+
+    int count = 0;
+    srand(42);
+    while (fgets(line, sizeof(line), f) && count < max_samples) {
+        // simple split (will not handle quoted commas)
+        char *cols[MAX_COLS];
+        int c = 0;
+        char *tok = strtok(line, ",\n\r");
+        while (tok && c < MAX_COLS) { cols[c++] = tok; tok = strtok(NULL, ",\n\r"); }
+
+        // fill sample
+        Sample s;
+        s.x = (idx_x>=0 && idx_x < c) ? to_double_or_default(cols[idx_x], 0.0) : ((double)rand()/RAND_MAX)*100.0 - 50.0;
+        s.y = (idx_y>=0 && idx_y < c) ? to_double_or_default(cols[idx_y], 0.0) : ((double)rand()/RAND_MAX)*100.0 + 1.0;
+        if (idx_range>=0 && idx_range < c) s.range = to_double_or_default(cols[idx_range], sqrt(s.x*s.x + s.y*s.y));
+        else s.range = sqrt(s.x*s.x + s.y*s.y + 1e-10);
+        s.velocity = (idx_vel>=0 && idx_vel < c) ? to_double_or_default(cols[idx_vel], 0.0) : ((double)rand()/RAND_MAX)*10.0 - 5.0;
+        s.snr = (idx_snr>=0 && idx_snr < c) ? to_double_or_default(cols[idx_snr], 20.0) : 10.0 + ((double)rand()/RAND_MAX)*50.0;
+        s.height = (idx_height>=0 && idx_height < c) ? to_double_or_default(cols[idx_height], 1.5) : 0.1 + ((double)rand()/RAND_MAX)*4.0;
+        s.intensity = (idx_int>=0 && idx_int < c) ? to_double_or_default(cols[idx_int], 0.0) : 0.0;
+        s.azimuth = (idx_az>=0 && idx_az < c) ? to_double_or_default(cols[idx_az], 0.0) : atan2(s.y, s.x) * 180.0 / M_PI;
+
+        // defaults for outputs
+        strcpy(s.object_type, "unknown");
+        s.classification_confidence = 0.0;
+        s.range_match_score = 0.0;
+        s.velocity_match_score = 0.0;
+        s.snr_match_score = 0.0;
+
+        samples[count++] = s;
+    }
+    fclose(f);
+    for (int i=0;i<ncols;i++) free(headers[i]);
+    return count;
+}
+
+// Apply classification ranges and assign object_type/confidences
+void apply_classification_ranges(Sample *samples, int n) {
+    for (int i=0;i<n;i++) {
+        double best_score = -1.0;
+        int best_idx = -1;
+        double scores[3];
+        double rscore, vscore, sscore, total;
+        for (int ci=0;ci<3;ci++) {
+            rscore = match_score(samples[i].range, classes[ci].range_min, classes[ci].range_max);
+            vscore = match_score(fabs(samples[i].velocity), classes[ci].velocity_min, classes[ci].velocity_max);
+            sscore = match_score(samples[i].snr, classes[ci].snr_min, classes[ci].snr_max);
+            total = rscore*0.4 + vscore*0.4 + sscore*0.2;
+            scores[ci] = total;
+            if (total > best_score) { best_score = total; best_idx = ci; }
+        }
+        if (best_idx >= 0) {
+            strcpy(samples[i].object_type, classes[best_idx].name);
+            samples[i].classification_confidence = best_score;
+            samples[i].range_match_score = match_score(samples[i].range, classes[best_idx].range_min, classes[best_idx].range_max);
+            samples[i].velocity_match_score = match_score(fabs(samples[i].velocity), classes[best_idx].velocity_min, classes[best_idx].velocity_max);
+            samples[i].snr_match_score = match_score(samples[i].snr, classes[best_idx].snr_min, classes[best_idx].snr_max);
+        } else {
+            strcpy(samples[i].object_type, "unknown");
+            samples[i].classification_confidence = 0.0;
+        }
+    }
+}
+
+// Write results CSV similarly to Python's predict_and_export results
+int write_results_csv(const char *out_path, Sample *samples, int n) {
+    FILE *f = fopen(out_path, "w");
+    if (!f) { fprintf(stderr, "Cannot open output file %s\n", out_path); return -1; }
+    // header
+    fprintf(f, "timestamp,object_id,x_position_m,y_position_m,actual_range_m,estimated_range_m,range_error_m,range_error_percent,velocity_mps,snr_db,predicted_class,classification_confidence,warning_level,direction,safety_risk,class_range_min_m,class_range_max_m,class_velocity_min_mps,class_velocity_max_mps,class_description\n");
+    // timestamp base
+    time_t t = time(NULL);
+    char tbuf[64];
+    struct tm tm = *localtime(&t);
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm);
+
+    for (int i=0;i<n;i++) {
+        Sample *s = &samples[i];
+        double estimated_range = s->range; // here our regressor placeholder returns actual range
+        double range_error = estimated_range - s->range;
+        double range_error_percent = (s->range == 0.0) ? 0.0 : (range_error / s->range) * 100.0;
+
+        // warning level logic
+        const char *warning = (estimated_range < 5.0) ? "CRITICAL" : ((estimated_range < 15.0) ? "WARNING" : "SAFE");
+        const char *direction = (s->velocity < 0.0) ? "APPROACHING" : ((s->velocity > 0.0) ? "MOVING_AWAY" : "STATIONARY");
+        const char *safety = "LOW";
+        if (strcmp(s->object_type, "pedestrian")==0 && estimated_range < 10.0) safety = "HIGH";
+        if (strcmp(s->object_type, "vehicle")==0 && estimated_range < 5.0) safety = "HIGH";
+
+        // find class params (if any)
+        double cmin=0, cmax=0, vmin=0, vmax=0;
+        char desc[128] = "Unknown";
+        for (int ci=0;ci<3;ci++) {
+            if (strcmp(classes[ci].name, s->object_type)==0) {
+                cmin = classes[ci].range_min; cmax = classes[ci].range_max;
+                vmin = classes[ci].velocity_min; vmax = classes[ci].velocity_max;
+                strcpy(desc, classes[ci].description);
+                break;
+            }
+        }
+
+        fprintf(f, "%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%s,%.6f,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s\n",
+            tbuf, i, s->x, s->y, s->range, estimated_range, range_error, range_error_percent,
+            s->velocity, s->snr, s->object_type, s->classification_confidence, warning, direction, safety,
+            cmin, cmax, vmin, vmax, desc
+        );
+    }
+    fclose(f);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *input_csv = "mmw_demo_output.csv";
+    const char *output_csv = "radar_c_results.csv";
+    if (argc >= 2) input_csv = argv[1];
+    if (argc >= 3) output_csv = argv[2];
+
+    init_classes();
+
+    Sample *samples = (Sample*) malloc(sizeof(Sample) * MAX_ROWS);
+    if (!samples) { fprintf(stderr, "Memory allocation failed\n"); return 1; }
+
+    int n = load_csv(input_csv, samples, MAX_ROWS);
+    if (n < 0) { free(samples); return 1; }
+    if (n == 0) { fprintf(stderr, "No data read from %s\n", input_csv); free(samples); return 1; }
+
+    printf("Loaded %d samples from %s\n", n, input_csv);
+
+    apply_classification_ranges(samples, n);
+
+    // print distribution summary
+    int counts_vehicle=0, counts_ped=0, counts_static=0, counts_unknown=0;
+    int critical=0, warning=0, safe=0, highrisk=0;
+    for (int i=0;i<n;i++) {
+        if (strcmp(samples[i].object_type, "vehicle")==0) counts_vehicle++;
+        else if (strcmp(samples[i].object_type, "pedestrian")==0) counts_ped++;
+        else if (strcmp(samples[i].object_type, "static_object")==0) counts_static++;
+        else counts_unknown++;
+
+        double est_range = samples[i].range;
+        const char *warning_lvl = (est_range < 5.0) ? "CRITICAL" : ((est_range < 15.0) ? "WARNING" : "SAFE");
+        if (strcmp(warning_lvl, "CRITICAL")==0) critical++;
+        else if (strcmp(warning_lvl, "WARNING")==0) warning++;
+        else safe++;
+
+        const char *safety = "LOW";
+        if (strcmp(samples[i].object_type, "pedestrian")==0 && est_range < 10.0) safety = "HIGH";
+        if (strcmp(samples[i].object_type, "vehicle")==0 && est_range < 5.0) safety = "HIGH";
+        if (strcmp(safety, "HIGH")==0) highrisk++;
+    }
+
+    printf("Distribution: vehicle=%d, pedestrian=%d, static_object=%d, unknown=%d\n",
+        counts_vehicle, counts_ped, counts_static, counts_unknown);
+    printf("Warnings: CRITICAL=%d, WARNING=%d, SAFE=%d, HIGH_RISK=%d\n",
+        critical, warning, safe, highrisk);
+
+    // export
+    if (write_results_csv(output_csv, samples, n) == 0) {
+        printf("Results exported to %s\n", output_csv);
+    }
+
+    free(samples);
+    return 0;
+}
