@@ -1,0 +1,336 @@
+# real_time_warning_system.py - FIXED VERSION
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+import pickle
+
+class RadarObjectClassifier:
+    def __init__(self):
+        self.classifier = None
+        self.regressor = None
+        self.scaler = None
+        self.label_encoder = None
+        self.features = ['x', 'y', 'z', 'v', 'snr', 'noise', 'range', 'rcs_estimated', 'velocity_mag', 'motion_consistency']
+    
+    def preprocess_for_prediction(self, radar_data):
+        """Preprocess radar data for real-time prediction"""
+        data = radar_data.copy()
+        
+        # Ensure all required features exist
+        if 'x' not in data:
+            data['x'] = 0
+        if 'y' not in data:
+            data['y'] = 0
+        if 'z' not in data:
+            data['z'] = 0
+        if 'v' not in data:
+            data['v'] = 0
+        if 'snr' not in data:
+            data['snr'] = 0
+        if 'noise' not in data:
+            data['noise'] = 500
+        
+        # Calculate derived features
+        data['range'] = np.sqrt(data['x']**2 + data['y']**2 + data['z']**2)
+        data['rcs_estimated'] = data['snr'] * (data['range']**4) / 1e12
+        data['velocity_mag'] = np.abs(data['v'])
+        data['motion_consistency'] = 0.5  # Default value
+        
+        return data
+    
+    def predict_single_frame(self, detObj):
+        """Predict object types for a single radar frame"""
+        if self.classifier is None or self.scaler is None:
+            raise ValueError("Models must be loaded first")
+        
+        num_obj = detObj["numObj"]
+        if num_obj == 0:
+            return []
+        
+        # Convert detObj to DataFrame
+        frame_data = []
+        for i in range(num_obj):
+            frame_data.append({
+                'x': detObj["x"][i],
+                'y': detObj["y"][i],
+                'z': detObj.get("z", [0] * num_obj)[i] if "z" in detObj else 0,
+                'v': detObj.get("v", [0] * num_obj)[i] if "v" in detObj else 0,
+                'snr': detObj.get("snr", [0] * num_obj)[i] if "snr" in detObj else 0,
+                'noise': detObj.get("noise", [500] * num_obj)[i] if "noise" in detObj else 500,
+                'range': detObj["range"][i] if "range" in detObj else 0,
+                'object_id': i
+            })
+        
+        df = pd.DataFrame(frame_data)
+        df = self.preprocess_for_prediction(df)
+        
+        # Ensure all features exist
+        for feature in self.features:
+            if feature not in df.columns:
+                df[feature] = 0
+        
+        # Make predictions
+        X = df[self.features].values
+        X_scaled = self.scaler.transform(X)
+        
+        class_predictions_encoded = self.classifier.predict(X_scaled)
+        class_predictions = self.label_encoder.inverse_transform(class_predictions_encoded)
+        confidence_scores = np.max(self.classifier.predict_proba(X_scaled), axis=1)
+        distance_predictions = self.regressor.predict(X_scaled)
+        
+        # Format results
+        results = []
+        for i in range(num_obj):
+            results.append({
+                'object_id': i,
+                'predicted_class': class_predictions[i],
+                'confidence': confidence_scores[i],
+                'estimated_distance': distance_predictions[i],
+                'x': df['x'].iloc[i],
+                'y': df['y'].iloc[i],
+                'z': df['z'].iloc[i],
+                'range': df['range'].iloc[i],
+                'velocity': df['v'].iloc[i]
+            })
+        
+        return results
+    
+    def load_models(self, path='radar_classifier_models.pkl'):
+        """Load trained models from disk"""
+        try:
+            with open(path, 'rb') as f:
+                models = pickle.load(f)
+            
+            self.classifier = models['classifier']
+            self.regressor = models['regressor']
+            self.scaler = models['scaler']
+            self.label_encoder = models['label_encoder']
+            self.features = models['features']
+            print(f"✓ ML models loaded from {path}")
+            return self
+        except FileNotFoundError:
+            print(f"⚠️ Warning: Model file {path} not found. Using fallback rules.")
+            return None
+
+class AdvancedRealTimeWarningSystem:  # Changed class name
+    def __init__(self, model_path='radar_classifier_models.pkl'):
+        # Initialize classifier
+        self.classifier = RadarObjectClassifier()
+        
+        # Try to load ML models
+        self.ml_models_loaded = False
+        if model_path:
+            result = self.classifier.load_models(model_path)
+            self.ml_models_loaded = result is not None
+        
+        # For compatibility with main script
+        self.ml_loaded = self.ml_models_loaded
+        
+        # Warning thresholds (in meters)
+        self.warning_thresholds = {
+            'pedestrian': 5.0,
+            'vehicle': 10.0,
+            'static_object': 3.0
+        }
+        
+        # Critical thresholds (in meters)
+        self.critical_thresholds = {
+            'pedestrian': 2.0,
+            'vehicle': 5.0,
+            'static_object': 1.0
+        }
+        
+        # Store history
+        self.warning_history = []
+        self.predictions_history = []
+        self.frame_counter = 0
+        self.display_buffer = []  # For visualization
+    
+    def simple_classify_object(self, x, y, z, v, snr, range_val):
+        """Simple rule-based classification (fallback if ML models not loaded)"""
+        speed = abs(v)
+        
+        # Simple classification rules
+        if speed < 0.5:  # Very slow or stationary
+            if range_val < 3 and snr < 200:
+                return "static_object", 0.85
+            else:
+                return "static_object", 0.75
+        elif speed <= 2.5:  # Walking speed
+            if range_val < 15 and snr > 150:
+                return "pedestrian", 0.90
+            else:
+                return "pedestrian", 0.70
+        else:  # Moving faster
+            if range_val > 5 and snr > 200:
+                return "vehicle", 0.88
+            else:
+                return "vehicle", 0.65
+    
+    def process_radar_frame(self, detObj):
+        """Process a single frame of radar data"""
+        if detObj["numObj"] == 0:
+            result = {
+                'frame': self.frame_counter,
+                'warnings': [],
+                'critical_alerts': [],
+                'predictions': [],
+                'num_objects': 0,
+                'frame_id': self.frame_counter
+            }
+            self.display_buffer.append(result)
+            return result
+        
+        predictions = []
+        warnings = []
+        critical_alerts = []
+        
+        if self.ml_models_loaded:
+            # Use ML model for prediction
+            predictions = self.classifier.predict_single_frame(detObj)
+        else:
+            # Use simple rule-based classification
+            num_obj = detObj["numObj"]
+            for i in range(num_obj):
+                x = detObj["x"][i]
+                y = detObj["y"][i]
+                z = detObj.get("z", [0] * num_obj)[i] if "z" in detObj else 0
+                v = detObj.get("v", [0] * num_obj)[i] if "v" in detObj else 0
+                snr = detObj.get("snr", [0] * num_obj)[i] if "snr" in detObj else 0
+                range_val = detObj.get("range", [0] * num_obj)[i] if "range" in detObj else np.sqrt(x**2 + y**2 + z**2)
+                
+                obj_type, confidence = self.simple_classify_object(x, y, z, v, snr, range_val)
+                
+                predictions.append({
+                    'object_id': i,
+                    'predicted_class': obj_type,
+                    'confidence': confidence,
+                    'estimated_distance': range_val,
+                    'x': x,
+                    'y': y,
+                    'z': z,
+                    'range': range_val,
+                    'velocity': v
+                })
+        
+        # Check for warnings
+        for pred in predictions:
+            obj_type = pred['predicted_class']
+            distance = pred['estimated_distance']
+            
+            if distance <= self.warning_thresholds.get(obj_type, 10.0):
+                warning_level = 'CRITICAL' if distance <= self.critical_thresholds.get(obj_type, 5.0) else 'WARNING'
+                
+                warning_msg = {
+                    'object_id': pred['object_id'],
+                    'object_type': obj_type,
+                    'distance': f"{distance:.2f}m",
+                    'position': f"({pred['x']:.1f}, {pred['y']:.1f})",
+                    'level': warning_level,
+                    'velocity': f"{pred['velocity']:.2f} m/s"
+                }
+                
+                if warning_level == 'CRITICAL':
+                    critical_alerts.append(warning_msg)
+                else:
+                    warnings.append(warning_msg)
+                
+                # Log to history
+                self.warning_history.append({
+                    'timestamp': datetime.now(),
+                    'frame': self.frame_counter,
+                    'object_type': obj_type,
+                    'distance': distance,
+                    'warning_level': warning_level
+                })
+        
+        # Create features dataframe for visualization
+        features_list = []
+        for pred in predictions:
+            features_list.append({
+                'x': pred['x'],
+                'y': pred['y'],
+                'z': pred['z'],
+                'v': pred['velocity'],
+                'range': pred['range']
+            })
+        
+        result = {
+            'frame': self.frame_counter,
+            'frame_id': self.frame_counter,
+            'predictions': [p['predicted_class'] for p in predictions],
+            'warnings': warnings,
+            'critical_alerts': critical_alerts,
+            'num_objects': len(predictions),
+            'features': pd.DataFrame(features_list) if features_list else pd.DataFrame()
+        }
+        
+        self.predictions_history.append(result)
+        self.display_buffer.append(result)
+        if len(self.display_buffer) > 100:
+            self.display_buffer.pop(0)
+        
+        self.frame_counter += 1
+        
+        return result
+    
+    # Wrapper methods for main script compatibility
+    def process_frame(self, detObj):
+        """Wrapper for process_radar_frame"""
+        return self.process_radar_frame(detObj)
+    
+    def print_frame_summary(self, result):
+        """Print summary of frame processing"""
+        if result['critical_alerts']:
+            print(f"🚨 Frame {result['frame']}: {len(result['critical_alerts'])} critical alerts!")
+        elif result['warnings']:
+            print(f"⚠️ Frame {result['frame']}: {len(result['warnings'])} warnings")
+        elif result['num_objects'] > 0:
+            print(f"✓ Frame {result['frame']}: {result['num_objects']} objects detected")
+    
+    def get_system_status(self):
+        """Get current system status"""
+        total_warnings = sum(1 for h in self.warning_history if h['warning_level'] == 'WARNING')
+        total_critical = sum(1 for h in self.warning_history if h['warning_level'] == 'CRITICAL')
+        
+        status = f"""
+        === Real-time Warning System Status ===
+        Frames processed: {self.frame_counter}
+        Total warnings: {total_warnings}
+        Critical alerts: {total_critical}
+        ML models loaded: {'✓' if self.ml_models_loaded else '⚠️ (using rule-based)'}
+        """
+        return status
+    
+    def save_session_data(self, filename='radar_session_with_warnings.csv'):
+        """Save all collected data to CSV"""
+        if not self.predictions_history:
+            print("No data to save.")
+            return
+        
+        all_data = []
+        for history in self.predictions_history:
+            # Skip frames without predictions
+            if 'predictions' not in history or not hasattr(history, 'predictions'):
+                continue
+            
+            for pred in history.get('features', []):
+                all_data.append({
+                    'frame': history['frame'],
+                    'object_type': pred.get('object_type', 'unknown'),
+                    'x': pred.get('x', 0),
+                    'y': pred.get('y', 0),
+                    'z': pred.get('z', 0),
+                    'range': pred.get('range', 0),
+                    'velocity': pred.get('v', 0)
+                })
+        
+        if all_data:
+            df = pd.DataFrame(all_data)
+            df.to_csv(filename, index=False)
+            print(f"✓ Session data saved to {filename}")
+            print(f"  Total frames: {len(self.predictions_history)}")
+            print(f"  Total objects: {len(df)}")
+        else:
+            print("⚠️ No valid data to save")
