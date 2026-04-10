@@ -1,1 +1,987 @@
+/*
+Copyright (c) 2018, IIT Madras All rights reserved.
+[Original copyright header preserved — see original fpga_top.v]
 
+CHANGES vs default gc2025 fpga_top.v  (all changes marked with // [RADAR]):
+  [1] Module port list: added radar physical pins
+        Removed from port:  gpio_24..gpio_31 (now inside JD as radar outputs)
+        Added to port:
+          input  radar_uart_rxd        — JA1 (G13) IWR6843 UART TX
+          input  radar_sd_miso         — JA4 (D12)
+          output radar_sd_cs_n         — JA2 (B11)
+          output radar_sd_mosi         — JA3 (A11)
+          output radar_sd_sclk         — JA7 (D13)
+          input  radar_hall_in         — gpio_8 / CK_IO[8] (N15)
+          output radar_pwm_l           — JD7  (E2)
+          output radar_pwm_r           — JD8  (D2)
+          output radar_in1             — JD1  (D4)
+          output radar_in2             — JD2  (D3)
+          output radar_in3             — JD3  (F4)
+          output radar_in4             — JD4  (F3)
+          output radar_buzzer          — JD9  (H2)
+          output radar_status_led      — JD10 (G2)
+  [2] AXI4-Lite wires for radar IP (axi4lite_master_ prefix)
+  [3] Radar IP instantiation: radar_adas_v5_axi4lite_v3 (v3.0)
+        Corrected: UART_BIT_PERIOD=868 (115200 baud at 100 MHz)
+        All v3.0 ports connected: dual PWM, IN1-4, SD SPI
+  [4] ext_interrupts_i expanded to 3-bit: {radar_irq, eth_irq, xadc_irq}
+  [5] IOBUFs for gpio_24..gpio_31 removed (JD dedicated to radar)
+  [6] cfg_sender Verilog module instantiated:
+        Sends ISK_6m_default.cfg to IWR6843 over a dedicated UART TX port
+        (radar_cfg_tx — JB3 = D15) immediately after reset deasserts
+  [7] gpio_8 connected as radar hall_in input (gpio_8 already on CK_IO[8])
+*/
+
+module fpga_top#( parameter AXI_ID_WIDTH = 4, parameter AXI_ADDR_WIDTH = 28)
+  (
+  // ---- DDR ports --------------//
+  inout  [15:0] ddr3_dq,
+  inout  [1:0]  ddr3_dqs_n,
+  inout  [1:0]  ddr3_dqs_p,    
+  output [13:0] ddr3_addr,
+  output [2:0]  ddr3_ba,
+  output        ddr3_ras_n,
+  output        ddr3_cas_n,
+  output        ddr3_we_n,
+  output        ddr3_reset_n,
+  output        ddr3_ck_p,
+  output        ddr3_ck_n,
+  output        ddr3_cke,
+  output        ddr3_cs_n,
+  output [1:0]  ddr3_dm,
+  output        ddr3_odt,
+  
+  // ethernet ports
+  input phy_tx_clk,
+  input phy_rx_clk,
+  input phy_crs,
+  input phy_dv,
+  input [3:0]phy_rx_data,
+  input phy_col,
+  input phy_rx_er,
+  output phy_rst_n,
+  output phy_tx_en,
+  output [3:0]phy_tx_data,
+  output phy_ref_clk,
+  inout phy_mdio,
+  output phy_mdc,
+
+   // ---- UART ports --------//
+    input         uart0_SIN,
+    output        uart0_SOUT,
+
+//   // ---- I2C ports --------//
+    inout         i2c0_sda,
+    inout         i2c0_scl,
+    inout         i2c1_sda,
+    inout         i2c1_scl,
+
+//   // ---- SPI ports ---------//
+   inout       spi0_mosi,
+   inout       spi0_nss,
+   inout       spi0_miso,
+
+  // ---- io_cell_ports(Pin Muxed) ---------//
+    inout io7_cell,
+    inout io8_cell,
+    inout io9_cell,
+    inout io10_cell,
+    inout io12_cell,
+    inout io13_cell,
+    inout io16_cell,
+    inout io17_cell,
+    inout io18_cell,
+    inout io19_cell,
+    inout io20_cell,
+
+    // ---- GPIO ports --------//
+    inout gpio_4,
+    inout gpio_7,
+    inout gpio_8,       // Hall sensor input (CK_IO[8] / N15)
+    inout gpio_14,
+    inout gpio_15,
+    inout gpio_16,
+    inout gpio_17,
+    inout gpio_18,
+    inout gpio_19,
+    inout gpio_20,
+    inout gpio_21,
+    inout gpio_22,
+    inout gpio_23,
+    // gpio_24..gpio_31 REMOVED from port — JD is now fully dedicated to radar outputs
+
+    input gptimer0_in,
+	output gptimer0_out,
+	input external_clk,
+
+  input gptimer1_in,
+	output gptimer1_out,
+
+  input gptimer2_in,
+	output gptimer2_out,
+
+  input gptimer3_in,
+	output gptimer3_out,
+
+    // ---- System Reset ------//
+    input         sys_rst,	//Active Low
+
+    // ---- System Clock ------//
+    input         sys_clk,
+
+    // ---- XADC signals -----//
+    input vauxp0, input vauxn0,
+    input vauxp4, input vauxn4,
+    input vauxp5, input vauxn5,
+    input vauxp6, input vauxn6,
+    input vauxp7, input vauxn7,
+    input vauxp12, input vauxp13, input vauxp14, input vauxp15,
+    input vauxn12, input vauxn13, input vauxn14, input vauxn15,
+    input vp_in, input vn_in,
+
+    // ================================================================
+    // [RADAR] Physical pins for Radar ADAS v3.0
+    // ================================================================
+    // JA Header — IWR6843 UART + SD card SPI
+    input  wire radar_uart_rxd,    // JA1 (G13): IWR6843 UART TX → FPGA RX
+    output wire radar_sd_cs_n,     // JA2 (B11): SD card CS (active low)
+    output wire radar_sd_mosi,     // JA3 (A11): SD card MOSI
+    input  wire radar_sd_miso,     // JA4 (D12): SD card MISO
+    output wire radar_sd_sclk,     // JA7 (D13): SD card SCLK
+
+    // JB — cfg_sender UART TX to IWR6843 UART RX port
+    output wire radar_cfg_tx,      // JB3 (D15): cfg sender UART TX → IWR6843 RX
+
+    // JD Header — All 8 pins dedicated to radar motor/actuator control
+    output wire radar_in1,         // JD1 (D4):  L298N IN1 (left forward)
+    output wire radar_in2,         // JD2 (D3):  L298N IN2 (left brake)
+    output wire radar_in3,         // JD3 (F4):  L298N IN3 (right forward)
+    output wire radar_in4,         // JD4 (F3):  L298N IN4 (right brake)
+    output wire radar_pwm_l,       // JD7 (E2):  L298N ENA (left  side PWM)
+    output wire radar_pwm_r,       // JD8 (D2):  L298N ENB (right side PWM)
+    output wire radar_buzzer,      // JD9 (H2):  Passive piezo buzzer
+    output wire radar_status_led   // JD10 (G2): Single status LED
+   );
+
+  reg aresetn;
+
+  wire                            soc_reset;
+  wire                            core_clk;
+  wire                              ddr3_main;
+  wire                              ddr3_ref;
+  wire                            locked;
+  wire                              clk;
+  wire                              rst;
+  wire                            mmcm_locked;
+
+  // AXI4 DDR wires (unchanged)
+  wire [AXI_ID_WIDTH-1:0]           m_axi_awid;
+  wire [AXI_ADDR_WIDTH-1:0]         m_axi_awaddr;
+  wire [7:0]                        m_axi_awlen;
+  wire [2:0]                        m_axi_awsize;
+  wire [1:0]                        m_axi_awburst;
+  wire [0:0]                        m_axi_awlock;
+  wire [3:0]                        m_axi_awcache;
+  wire [2:0]                        m_axi_awprot;
+  wire                              m_axi_awvalid;
+  wire                              m_axi_awready;    
+  wire [31:0]                       m_axi_wdata;
+  wire [3:0]                        m_axi_wstrb;
+  wire                              m_axi_wlast;
+  wire                              m_axi_wvalid;
+  wire                              m_axi_wready;   
+  wire                              m_axi_bready;
+  wire [AXI_ID_WIDTH-1:0]           m_axi_bid;
+  wire [1:0]                        m_axi_bresp;
+  wire                              m_axi_bvalid;   
+  wire [AXI_ID_WIDTH-1:0]           m_axi_arid;
+  wire [AXI_ADDR_WIDTH-1:0]         m_axi_araddr;
+  wire [7:0]                        m_axi_arlen;
+  wire [2:0]                        m_axi_arsize;
+  wire [1:0]                        m_axi_arburst;
+  wire [0:0]                        m_axi_arlock;
+  wire [3:0]                        m_axi_arcache;
+  wire [2:0]                        m_axi_arprot;
+  wire                              m_axi_arvalid;
+  wire                              m_axi_arready;    
+  wire                              m_axi_rready;
+  wire [AXI_ID_WIDTH-1:0]           m_axi_rid;
+  wire [31:0]                       m_axi_rdata;
+  wire [1:0]                        m_axi_rresp;
+  wire                              m_axi_rlast;
+  wire                              m_axi_rvalid;   
+
+  wire [AXI_ID_WIDTH-1:0]           s_axi_awid;
+  wire [AXI_ADDR_WIDTH-1:0]         s_axi_awaddr;
+  wire [7:0]                        s_axi_awlen;
+  wire [2:0]                        s_axi_awsize;
+  wire [1:0]                        s_axi_awburst;
+  wire [0:0]                        s_axi_awlock;
+  wire [3:0]                        s_axi_awcache;
+  wire [2:0]                        s_axi_awprot;
+  wire                              s_axi_awvalid;
+  wire                              s_axi_awready;    
+  wire [31:0]                       s_axi_wdata;
+  wire [3:0]                        s_axi_wstrb;
+  wire                              s_axi_wlast;
+  wire                              s_axi_wvalid;
+  wire                              s_axi_wready;
+  wire                              s_axi_bready;
+  wire [AXI_ID_WIDTH-1:0]           s_axi_bid;
+  wire [1:0]                        s_axi_bresp;
+  wire                              s_axi_bvalid;
+  wire [AXI_ID_WIDTH-1:0]           s_axi_arid;
+  wire [AXI_ADDR_WIDTH-1:0]         s_axi_araddr;
+  wire [7:0]                        s_axi_arlen;
+  wire [2:0]                        s_axi_arsize;
+  wire [1:0]                        s_axi_arburst;
+  wire [0:0]                        s_axi_arlock;
+  wire [3:0]                        s_axi_arcache;
+  wire [2:0]                        s_axi_arprot;
+  wire                              s_axi_arvalid;
+  wire                              s_axi_arready;
+  wire                              s_axi_rready;
+  wire [AXI_ID_WIDTH-1:0]           s_axi_rid;
+  wire [31:0]                       s_axi_rdata;
+  wire [1:0]                        s_axi_rresp;
+  wire                              s_axi_rlast;
+  wire                              s_axi_rvalid;   
+  wire [11:0]                       device_temp; 
+  // [RADAR] 3-bit interrupt bus: [2]=radar [1]=eth [0]=xadc
+  wire [2:0]                         interrupts;
+
+   wire phy_mdio_o, phy_mdio_i, phy_mdio_t;
+
+   wire i2c0_scl_out, i2c0_scl_in, i2c0_scl_out_en;
+   wire i2c0_sda_out, i2c0_sda_in, i2c0_sda_out_en;
+   wire i2c1_scl_out, i2c1_scl_in, i2c1_scl_out_en;
+   wire i2c1_sda_out, i2c1_sda_in, i2c1_sda_out_en;
+
+   wire io7_cell_in,  io7_cell_out,  io7_cell_en;
+   wire io8_cell_in,  io8_cell_out,  io8_cell_en;
+   wire io9_cell_in,  io9_cell_out,  io9_cell_en;
+   wire io10_cell_in, io10_cell_out, io10_cell_en;
+   wire io12_cell_in, io12_cell_out, io12_cell_en;
+   wire io13_cell_in, io13_cell_out, io13_cell_en;
+   wire io16_cell_in, io16_cell_out, io16_cell_en;
+   wire io17_cell_in, io17_cell_out, io17_cell_en;
+   wire io18_cell_in, io18_cell_out, io18_cell_en;
+   wire io19_cell_in, io19_cell_out, io19_cell_en;
+   wire io20_cell_in, io20_cell_out, io20_cell_en;
+
+   wire gpio_4_in,  gpio_4_out,  gpio_4_en;
+   wire gpio_7_in,  gpio_7_out,  gpio_7_en;
+   wire gpio_8_in,  gpio_8_out,  gpio_8_en;   // Hall sensor
+   wire gpio_14_in, gpio_14_out, gpio_14_en;
+   wire gpio_15_in, gpio_15_out, gpio_15_en;
+   wire gpio_16_in, gpio_16_out, gpio_16_en;
+   wire gpio_17_in, gpio_17_out, gpio_17_en;
+   wire gpio_18_in, gpio_18_out, gpio_18_en;
+   wire gpio_19_in, gpio_19_out, gpio_19_en;
+   wire gpio_20_in, gpio_20_out, gpio_20_en;
+   wire gpio_21_in, gpio_21_out, gpio_21_en;
+   wire gpio_22_in, gpio_22_out, gpio_22_en;
+   wire gpio_23_in, gpio_23_out, gpio_23_en;
+   // gpio_24..gpio_31 wires removed — JD is radar-only
+
+   wire ip2intc_irpt;
+   wire eth10_ip2intc_irpt;
+   wire xadc_ip2intc_irpt;
+
+// JTAG wires
+    wire wire_tck_clk;
+    wire wire_trst;
+    wire wire_capture;
+    wire wire_run_test;
+    wire wire_sel;
+    wire wire_shift;
+    wire wire_tdi;
+    wire wire_tms;
+    wire wire_update;
+    wire wire_tdo;
+
+    BSCANE2 #(.JTAG_CHAIN(4)) bse2_inst (
+      .CAPTURE(wire_capture), .DRCK(), .RESET(wire_trst),
+      .RUNTEST(wire_run_test), .SEL(wire_sel), .SHIFT(wire_shift),
+      .TCK(wire_tck_clk), .TDI(wire_tdi), .TMS(wire_tms),
+      .UPDATE(wire_update), .TDO(wire_tdo)
+    );
+
+   // XADC AXI4-Lite
+    wire xadc_master_awvalid;
+    wire [11-1 : 0] xadc_master_awaddr;
+    wire xadc_master_m_awready_awready;
+    wire xadc_master_wvalid;
+    wire [32-1 : 0] xadc_master_wdata;
+    wire [(32/8)-1 : 0] xadc_master_wstrb;
+    wire xadc_master_m_wready_wready;
+    wire xadc_master_m_bvalid_bvalid;
+    wire [1:0] xadc_master_m_bvalid_bresp;
+    wire xadc_master_bready;
+    wire xadc_master_arvalid;
+    wire [11-1 : 0] xadc_master_araddr;
+    wire xadc_master_m_arready_arready;
+    wire xadc_master_m_rvalid_rvalid;
+    wire [1 : 0] xadc_master_m_rvalid_rresp;
+    wire [32-1 : 0] xadc_master_m_rvalid_rdata;
+    wire xadc_master_rready;
+
+   // ETH AXI4-Lite
+    wire eth_master_awvalid;
+    wire [13-1 : 0] eth_master_awaddr;
+    wire eth_master_m_awready_awready;
+    wire eth_master_wvalid;
+    wire [32-1 : 0] eth_master_wdata;
+    wire [(32/8)-1 : 0] eth_master_wstrb;
+    wire eth_master_m_wready_wready;
+    wire eth_master_m_bvalid_bvalid;
+    wire [1:0] eth_master_m_bvalid_bresp;
+    wire eth_master_bready;
+    wire eth_master_arvalid;
+    wire [13-1 : 0] eth_master_araddr;
+    wire eth_master_m_arready_arready;
+    wire eth_master_m_rvalid_rvalid;
+    wire [1 : 0] eth_master_m_rvalid_rresp;
+    wire [32-1 : 0] eth_master_m_rvalid_rdata;
+    wire eth_master_rready;
+
+  // ================================================================
+  // [RADAR] AXI4-Lite wires for Radar ADAS IP
+  // ================================================================
+   wire        axi4lite_master_awvalid;
+   wire [27:0] axi4lite_master_awaddr;
+   wire        axi4lite_master_awready;
+   wire        axi4lite_master_wvalid;
+   wire [31:0] axi4lite_master_wdata;
+   wire [3:0]  axi4lite_master_wstrb;
+   wire        axi4lite_master_wready;
+   wire        axi4lite_master_bvalid;
+   wire [1:0]  axi4lite_master_bresp;
+   wire        axi4lite_master_bready;
+   wire        axi4lite_master_arvalid;
+   wire [27:0] axi4lite_master_araddr;
+   wire        axi4lite_master_arready;
+   wire        axi4lite_master_rvalid;
+   wire [1:0]  axi4lite_master_rresp;
+   wire [31:0] axi4lite_master_rdata;
+   wire        axi4lite_master_rready;
+
+   // [RADAR] IRQ wire from radar IP to interrupt bus
+   wire        radar_irq;
+
+  // ================================================================
+  // SPI0 wires
+  // ================================================================
+   wire spi0_io_mosi_out, spi0_io_mosi_outen, spi0_io_mosi_in_val;
+   wire spi0_io_miso_out, spi0_io_miso_outen, spi0_io_miso_in_val;
+   wire spi0_io_nss_out,  spi0_io_nss_outen,  spi0_io_nss_in_val;
+   wire spi0_io_sclk_out, spi0_io_sclk_outen, spi0_io_sclk_in_val;
+
+  wire [31:0] temp_s_axi_awaddr, temp_s_axi_araddr;
+  assign s_axi_awaddr = temp_s_axi_awaddr [AXI_ADDR_WIDTH-1:0];
+  assign s_axi_araddr = temp_s_axi_araddr [AXI_ADDR_WIDTH-1:0];
+
+  proc_sys_reset_0 proc_reset_inst (
+      .slowest_sync_clk (core_clk),
+      .ext_reset_in     (sys_rst),
+      .aux_reset_in     (init_calib_complete),
+      .mb_debug_sys_rst (0),
+      .dcm_locked       (locked),
+      .mb_reset         (soc_reset),
+      .bus_struct_reset (),
+      .peripheral_reset (),
+      .interconnect_aresetn (),
+      .peripheral_aresetn ()
+  );
+
+   clk_divider clk_div (
+      .clk_in1(sys_clk),
+      .clk_out1(core_clk),
+      .clk_out2(ddr3_main),
+      .clk_out3(ddr3_ref),
+      .clk_out4(phy_ref_clk),
+      .resetn(1'b1), 
+      .locked(locked)
+  );
+
+  mig_ddr3 mig_ddr3 (
+      .ddr3_addr(ddr3_addr), .ddr3_ba(ddr3_ba), .ddr3_cas_n(ddr3_cas_n),
+      .ddr3_ck_n(ddr3_ck_n), .ddr3_ck_p(ddr3_ck_p), .ddr3_cke(ddr3_cke),
+      .ddr3_ras_n(ddr3_ras_n), .ddr3_we_n(ddr3_we_n), .ddr3_dq(ddr3_dq),
+      .ddr3_dqs_n(ddr3_dqs_n), .ddr3_dqs_p(ddr3_dqs_p),
+      .ddr3_reset_n(ddr3_reset_n), .init_calib_complete(init_calib_complete),
+      .ddr3_cs_n(ddr3_cs_n), .ddr3_dm(ddr3_dm), .ddr3_odt(ddr3_odt),
+      .ui_clk(clk), .ui_clk_sync_rst(rst), .mmcm_locked(mmcm_locked),
+      .aresetn(aresetn), .app_sr_req(1'b0), .app_ref_req(1'b0),
+      .app_zq_req(1'b0), .app_sr_active(), .app_ref_ack(), .app_zq_ack(),
+      .s_axi_awid(m_axi_awid), .s_axi_awaddr(m_axi_awaddr),
+      .s_axi_awlen(m_axi_awlen), .s_axi_awsize(m_axi_awsize),
+      .s_axi_awburst(m_axi_awburst), .s_axi_awlock(m_axi_awlock),
+      .s_axi_awcache(m_axi_awcache), .s_axi_awprot(m_axi_awprot),
+      .s_axi_awqos(4'h0), .s_axi_awvalid(m_axi_awvalid), .s_axi_awready(m_axi_awready),
+      .s_axi_wdata(m_axi_wdata), .s_axi_wstrb(m_axi_wstrb), .s_axi_wlast(m_axi_wlast),
+      .s_axi_wvalid(m_axi_wvalid), .s_axi_wready(m_axi_wready),
+      .s_axi_bid(m_axi_bid), .s_axi_bresp(m_axi_bresp), .s_axi_bvalid(m_axi_bvalid),
+      .s_axi_bready(m_axi_bready),
+      .s_axi_arid(m_axi_arid), .s_axi_araddr(m_axi_araddr), .s_axi_arlen(m_axi_arlen),
+      .s_axi_arsize(m_axi_arsize), .s_axi_arburst(m_axi_arburst),
+      .s_axi_arlock(m_axi_arlock), .s_axi_arcache(m_axi_arcache),
+      .s_axi_arprot(m_axi_arprot), .s_axi_arqos(4'h0),
+      .s_axi_arvalid(m_axi_arvalid), .s_axi_arready(m_axi_arready),
+      .s_axi_rid(m_axi_rid), .s_axi_rdata(m_axi_rdata), .s_axi_rresp(m_axi_rresp),
+      .s_axi_rlast(m_axi_rlast), .s_axi_rvalid(m_axi_rvalid), .s_axi_rready(m_axi_rready),
+      .sys_clk_i(ddr3_main), .clk_ref_i(ddr3_ref),
+      .device_temp_i(device_temp), .sys_rst(locked)
+   );
+
+   always @(posedge clk) begin
+     aresetn <= ~rst;
+   end
+   
+   clk_converter clock_converter (
+       .s_axi_aclk(core_clk), .s_axi_aresetn(~soc_reset),
+       .s_axi_awid(s_axi_awid), .s_axi_awaddr(s_axi_awaddr),
+       .s_axi_awlen(s_axi_awlen), .s_axi_awsize(s_axi_awsize),
+       .s_axi_awburst(s_axi_awburst), .s_axi_awlock(1'b0),
+       .s_axi_awcache(4'b10), .s_axi_awprot(s_axi_awprot),
+       .s_axi_awregion(4'b0), .s_axi_awqos(4'b0),
+       .s_axi_awvalid(s_axi_awvalid), .s_axi_awready(s_axi_awready),
+       .s_axi_wdata(s_axi_wdata), .s_axi_wstrb(s_axi_wstrb),
+       .s_axi_wlast(s_axi_wlast), .s_axi_wvalid(s_axi_wvalid),
+       .s_axi_wready(s_axi_wready),
+       .s_axi_bid(s_axi_bid), .s_axi_bresp(s_axi_bresp),
+       .s_axi_bvalid(s_axi_bvalid), .s_axi_bready(s_axi_bready),
+       .s_axi_arid(s_axi_arid), .s_axi_araddr(s_axi_araddr),
+       .s_axi_arlen(s_axi_arlen), .s_axi_arsize(s_axi_arsize),
+       .s_axi_arburst(s_axi_arburst), .s_axi_arlock(1'b0),
+       .s_axi_arcache(4'b10), .s_axi_arprot(s_axi_arprot),
+       .s_axi_arregion(4'b0), .s_axi_arqos(4'b0),
+       .s_axi_arvalid(s_axi_arvalid), .s_axi_arready(s_axi_arready),
+       .s_axi_rid(s_axi_rid), .s_axi_rdata(s_axi_rdata),
+       .s_axi_rresp(s_axi_rresp), .s_axi_rlast(s_axi_rlast),
+       .s_axi_rvalid(s_axi_rvalid), .s_axi_rready(s_axi_rready),
+       .m_axi_aclk(clk), .m_axi_aresetn(aresetn),
+       .m_axi_awid(m_axi_awid), .m_axi_awaddr(m_axi_awaddr),
+       .m_axi_awlen(m_axi_awlen), .m_axi_awsize(m_axi_awsize),
+       .m_axi_awburst(m_axi_awburst), .m_axi_awlock(m_axi_awlock),
+       .m_axi_awcache(m_axi_awcache), .m_axi_awprot(m_axi_awprot),
+       .m_axi_awregion(), .m_axi_awqos(), .m_axi_awvalid(m_axi_awvalid),
+       .m_axi_awready(m_axi_awready), .m_axi_wdata(m_axi_wdata),
+       .m_axi_wstrb(m_axi_wstrb), .m_axi_wlast(m_axi_wlast),
+       .m_axi_wvalid(m_axi_wvalid), .m_axi_wready(m_axi_wready),
+       .m_axi_bid(m_axi_bid), .m_axi_bresp(m_axi_bresp),
+       .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(m_axi_bready),
+       .m_axi_arid(m_axi_arid), .m_axi_araddr(m_axi_araddr),
+       .m_axi_arlen(m_axi_arlen), .m_axi_arsize(m_axi_arsize),
+       .m_axi_arburst(m_axi_arburst), .m_axi_arlock(m_axi_arlock),
+       .m_axi_arcache(m_axi_arcache), .m_axi_arprot(m_axi_arprot),
+       .m_axi_arregion(), .m_axi_arqos(), .m_axi_arvalid(m_axi_arvalid),
+       .m_axi_arready(m_axi_arready), .m_axi_rid(m_axi_rid),
+       .m_axi_rdata(m_axi_rdata), .m_axi_rresp(m_axi_rresp),
+       .m_axi_rlast(m_axi_rlast), .m_axi_rvalid(m_axi_rvalid), 
+       .m_axi_rready(m_axi_rready)
+   );
+
+   // ================================================================
+   // Instantiating the C-class SoC (mkDebugSoc)
+   // ================================================================
+   mkDebugSoc core(
+        .CLK(core_clk), .RST_N(~soc_reset),
+        .CLK_tck_clk(wire_tck_clk), .RST_N_trst(~wire_trst),
+        .CLK_ext_clk(external_clk),
+        .wire_capture_capture_in(wire_capture),
+        .wire_run_test_run_test_in(wire_run_test),
+        .wire_sel_sel_in(wire_sel),
+        .wire_shift_shift_in(wire_shift),
+        .wire_tdi_tdi_in(wire_tdi),
+        .wire_tms_tms_in(wire_tms),
+        .wire_update_update_in(wire_update),
+        .wire_tdo(wire_tdo),
+
+        .spi0_io_mosi_out(spi0_io_mosi_out),
+        .spi0_io_mosi_outen(spi0_io_mosi_outen),
+        .spi0_io_mosi_in_val(spi0_io_mosi_in_val),
+        .spi0_io_sclk_out(spi0_io_sclk_out),
+        .spi0_io_sclk_outen(spi0_io_sclk_outen),
+        .spi0_io_sclk_in_val(spi0_io_sclk_in_val),
+        .spi0_io_ncs_out0(spi0_io_nss_out),
+        .spi0_io_ncs_outen0(spi0_io_nss_outen),
+        .spi0_io_ncs_in0_val(spi0_io_nss_in_val),
+	.spi0_io_miso_out(spi0_io_miso_out),
+	.spi0_io_miso_outen(spi0_io_miso_outen),
+	.spi0_io_miso_in_val(spi0_io_miso_in_val),
+
+        .uart0_io_SIN(uart0_SIN),
+        .uart0_io_SOUT(uart0_SOUT),
+
+	   .mem_master_AWVALID (s_axi_awvalid),
+	   .mem_master_AWADDR  (temp_s_axi_awaddr),
+	   .mem_master_AWSIZE  (s_axi_awsize),
+	   .mem_master_AWPROT  (s_axi_awprot),
+	   .mem_master_AWLEN   (s_axi_awlen),
+	   .mem_master_AWBURST (s_axi_awburst),
+	   .mem_master_AWID    (s_axi_awid),
+	   .mem_master_AWREADY (s_axi_awready),
+	   .mem_master_WVALID  (s_axi_wvalid),
+	   .mem_master_WDATA   (s_axi_wdata),
+	   .mem_master_WSTRB   (s_axi_wstrb),
+	   .mem_master_WLAST   (s_axi_wlast),
+	   .mem_master_WID     (),
+	   .mem_master_WREADY  (s_axi_wready),
+	   .mem_master_BVALID  (s_axi_bvalid),
+	   .mem_master_BRESP   (s_axi_bresp),
+	   .mem_master_BID     (s_axi_bid),
+	   .mem_master_BREADY  (s_axi_bready),
+	   .mem_master_ARVALID (s_axi_arvalid),
+	   .mem_master_ARADDR  (temp_s_axi_araddr),
+	   .mem_master_ARSIZE  (s_axi_arsize),
+	   .mem_master_ARPROT  (s_axi_arprot),
+	   .mem_master_ARLEN   (s_axi_arlen),
+	   .mem_master_ARBURST (s_axi_arburst),
+	   .mem_master_ARID    (s_axi_arid),
+	   .mem_master_ARREADY (s_axi_arready),
+	   .mem_master_RVALID (s_axi_rvalid),
+	   .mem_master_RRESP  (s_axi_rresp),
+	   .mem_master_RDATA  (s_axi_rdata),
+	   .mem_master_RLAST  (s_axi_rlast),
+	   .mem_master_RID    (s_axi_rid),
+	   .mem_master_RREADY(s_axi_rready),
+
+        .i2c0_out_scl_out (i2c0_scl_out),
+        .i2c0_out_scl_in_in(i2c0_scl_in),
+        .i2c0_out_scl_out_en(i2c0_scl_out_en),
+        .i2c0_out_sda_out(i2c0_sda_out),
+        .i2c0_out_sda_in_in(i2c0_sda_in),
+        .i2c0_out_sda_out_en(i2c0_sda_out_en),
+        .i2c1_out_scl_out (i2c1_scl_out),
+        .i2c1_out_scl_in_in(i2c1_scl_in),
+        .i2c1_out_scl_out_en(i2c1_scl_out_en),
+        .i2c1_out_sda_out(i2c1_sda_out),
+        .i2c1_out_sda_in_in(i2c1_sda_in),
+        .i2c1_out_sda_out_en(i2c1_sda_out_en),
+
+        .gptimer0_io_input_signal_signal_in(gptimer0_in),
+	    .gptimer0_io_timer_out(gptimer0_out),
+        .gptimer1_io_input_signal_signal_in(gptimer1_in),
+	    .gptimer1_io_timer_out(gptimer1_out),
+        .gptimer2_io_input_signal_signal_in(gptimer2_in),
+	    .gptimer2_io_timer_out(gptimer2_out),
+        .gptimer3_io_input_signal_signal_in(gptimer3_in),
+	    .gptimer3_io_timer_out(gptimer3_out),
+
+        .iocell_io_io7_cell_in_in(io7_cell_in),
+        .iocell_io_io8_cell_in_in(io8_cell_in),
+        .iocell_io_io9_cell_in_in(io9_cell_in),
+        .iocell_io_io10_cell_in_in(io10_cell_in),
+        .iocell_io_io12_cell_in_in(io12_cell_in),
+        .iocell_io_io13_cell_in_in(io13_cell_in),
+        .iocell_io_io16_cell_in_in(io16_cell_in),
+        .iocell_io_io17_cell_in_in(io17_cell_in),
+        .iocell_io_io18_cell_in_in(io18_cell_in),
+        .iocell_io_io19_cell_in_in(io19_cell_in),
+        .iocell_io_io20_cell_in_in(io20_cell_in),
+        .iocell_io_io7_cell_out(io7_cell_out),
+        .iocell_io_io8_cell_out(io8_cell_out),
+        .iocell_io_io9_cell_out(io9_cell_out),
+        .iocell_io_io10_cell_out(io10_cell_out),
+        .iocell_io_io12_cell_out(io12_cell_out),
+        .iocell_io_io13_cell_out(io13_cell_out),
+        .iocell_io_io16_cell_out(io16_cell_out),
+        .iocell_io_io17_cell_out(io17_cell_out),
+        .iocell_io_io18_cell_out(io18_cell_out),
+        .iocell_io_io19_cell_out(io19_cell_out),
+        .iocell_io_io20_cell_out(io20_cell_out),
+        .iocell_io_io7_cell_outen(io7_cell_en),
+        .iocell_io_io8_cell_outen(io8_cell_en),
+        .iocell_io_io9_cell_outen(io9_cell_en),
+        .iocell_io_io10_cell_outen(io10_cell_en),
+        .iocell_io_io12_cell_outen(io12_cell_en),
+        .iocell_io_io13_cell_outen(io13_cell_en),
+        .iocell_io_io16_cell_outen(io16_cell_en),
+        .iocell_io_io17_cell_outen(io17_cell_en),
+        .iocell_io_io18_cell_outen(io18_cell_en),
+        .iocell_io_io19_cell_outen(io19_cell_en),
+        .iocell_io_io20_cell_outen(io20_cell_en),
+        
+        .eth_master_awvalid(eth_master_awvalid),
+        .eth_master_awaddr(eth_master_awaddr),
+        .eth_master_m_awready_awready(eth_master_m_awready_awready),
+        .eth_master_wvalid(eth_master_wvalid),
+        .eth_master_wdata(eth_master_wdata),
+        .eth_master_wstrb(eth_master_wstrb),
+        .eth_master_m_wready_wready(eth_master_m_wready_wready),
+        .eth_master_m_bvalid_bvalid(eth_master_m_bvalid_bvalid),
+        .eth_master_m_bvalid_bresp(eth_master_m_bvalid_bresp),
+        .eth_master_bready(eth_master_bready),
+        .eth_master_arvalid(eth_master_arvalid),
+        .eth_master_araddr(eth_master_araddr),
+        .eth_master_m_arready_arready(eth_master_m_arready_arready),
+        .eth_master_m_rvalid_rvalid(eth_master_m_rvalid_rvalid),
+        .eth_master_m_rvalid_rresp(eth_master_m_rvalid_rresp),
+        .eth_master_m_rvalid_rdata(eth_master_m_rvalid_rdata),
+        .eth_master_rready(eth_master_rready),
+
+        .xadc_master_awvalid(xadc_master_awvalid),
+        .xadc_master_awaddr(xadc_master_awaddr),
+        .xadc_master_m_awready_awready(xadc_master_m_awready_awready),
+        .xadc_master_wvalid(xadc_master_wvalid),
+        .xadc_master_wdata(xadc_master_wdata),
+        .xadc_master_wstrb(xadc_master_wstrb),
+        .xadc_master_m_wready_wready(xadc_master_m_wready_wready),
+        .xadc_master_m_bvalid_bvalid(xadc_master_m_bvalid_bvalid),
+        .xadc_master_m_bvalid_bresp(xadc_master_m_bvalid_bresp),
+        .xadc_master_bready(xadc_master_bready),
+        .xadc_master_arvalid(xadc_master_arvalid),
+        .xadc_master_araddr(xadc_master_araddr),
+        .xadc_master_m_arready_arready(xadc_master_m_arready_arready),
+        .xadc_master_m_rvalid_rvalid(xadc_master_m_rvalid_rvalid),
+        .xadc_master_m_rvalid_rresp(xadc_master_m_rvalid_rresp),
+        .xadc_master_m_rvalid_rdata(xadc_master_m_rvalid_rdata),
+        .xadc_master_rready(xadc_master_rready),
+
+        // [RADAR] AXI4-Lite master → Radar ADAS IP
+        .axi4lite_master_awvalid(axi4lite_master_awvalid),
+        .axi4lite_master_awaddr(axi4lite_master_awaddr),
+        .axi4lite_master_m_awready_awready(axi4lite_master_awready),
+        .axi4lite_master_wvalid(axi4lite_master_wvalid),
+        .axi4lite_master_wdata(axi4lite_master_wdata),
+        .axi4lite_master_wstrb(axi4lite_master_wstrb),
+        .axi4lite_master_m_wready_wready(axi4lite_master_wready),
+        .axi4lite_master_m_bvalid_bvalid(axi4lite_master_bvalid),
+        .axi4lite_master_m_bvalid_bresp(axi4lite_master_bresp),
+        .axi4lite_master_bready(axi4lite_master_bready),
+        .axi4lite_master_arvalid(axi4lite_master_arvalid),
+        .axi4lite_master_araddr(axi4lite_master_araddr),
+        .axi4lite_master_m_arready_arready(axi4lite_master_arready),
+        .axi4lite_master_m_rvalid_rvalid(axi4lite_master_rvalid),
+        .axi4lite_master_m_rvalid_rresp(axi4lite_master_rresp),
+        .axi4lite_master_m_rvalid_rdata(axi4lite_master_rdata),
+        .axi4lite_master_rready(axi4lite_master_rready),
+
+        //GPIO (gpio_24..gpio_31 removed — JD is now radar-only)
+        .gpio_4_in(gpio_4_in),   .gpio_7_in(gpio_7_in),   .gpio_8_in(gpio_8_in),
+        .gpio_14_in(gpio_14_in), .gpio_15_in(gpio_15_in), .gpio_16_in(gpio_16_in),
+        .gpio_17_in(gpio_17_in), .gpio_18_in(gpio_18_in), .gpio_19_in(gpio_19_in),
+        .gpio_20_in(gpio_20_in), .gpio_21_in(gpio_21_in), .gpio_22_in(gpio_22_in),
+        .gpio_23_in(gpio_23_in),
+        .gpio_24_in(1'b0), .gpio_25_in(1'b0), .gpio_26_in(1'b0), .gpio_27_in(1'b0),
+        .gpio_28_in(1'b0), .gpio_29_in(1'b0), .gpio_30_in(1'b0), .gpio_31_in(1'b0),
+        .gpio_4_out(gpio_4_out),   .gpio_7_out(gpio_7_out),   .gpio_8_out(gpio_8_out),
+        .gpio_14_out(gpio_14_out), .gpio_15_out(gpio_15_out), .gpio_16_out(gpio_16_out),
+        .gpio_17_out(gpio_17_out), .gpio_18_out(gpio_18_out), .gpio_19_out(gpio_19_out),
+        .gpio_20_out(gpio_20_out), .gpio_21_out(gpio_21_out), .gpio_22_out(gpio_22_out),
+        .gpio_23_out(gpio_23_out),
+        .gpio_24_out(), .gpio_25_out(), .gpio_26_out(), .gpio_27_out(),
+        .gpio_28_out(), .gpio_29_out(), .gpio_30_out(), .gpio_31_out(),
+        .gpio_4_outen(gpio_4_en),   .gpio_7_outen(gpio_7_en),   .gpio_8_outen(gpio_8_en),
+        .gpio_14_outen(gpio_14_en), .gpio_15_outen(gpio_15_en), .gpio_16_outen(gpio_16_en),
+        .gpio_17_outen(gpio_17_en), .gpio_18_outen(gpio_18_en), .gpio_19_outen(gpio_19_en),
+        .gpio_20_outen(gpio_20_en), .gpio_21_outen(gpio_21_en), .gpio_22_outen(gpio_22_en),
+        .gpio_23_outen(gpio_23_en),
+        .gpio_24_outen(), .gpio_25_outen(), .gpio_26_outen(), .gpio_27_outen(),
+        .gpio_28_outen(), .gpio_29_outen(), .gpio_30_outen(), .gpio_31_outen(),
+
+        // [CHANGED] 3-bit interrupt: [2]=radar [1]=eth [0]=xadc
+        .ext_interrupts_i(interrupts)
+   );
+
+// ================================================================
+// ETH, XADC instantiations (unchanged from original)
+// ================================================================
+axi_ethernetlite_0 eth10 (
+  .s_axi_aclk(core_clk), .s_axi_aresetn(~soc_reset),
+  .ip2intc_irpt(eth10_ip2intc_irpt),
+  .s_axi_awaddr(eth_master_awaddr), .s_axi_awvalid(eth_master_awvalid),
+  .s_axi_awready(eth_master_m_awready_awready),
+  .s_axi_wdata(eth_master_wdata), .s_axi_wstrb(eth_master_wstrb),
+  .s_axi_wvalid(eth_master_wvalid), .s_axi_wready(eth_master_m_wready_wready),
+  .s_axi_bresp(eth_master_m_bvalid_bresp), .s_axi_bvalid(eth_master_m_bvalid_bvalid),
+  .s_axi_bready(eth_master_bready),
+  .s_axi_araddr(eth_master_araddr), .s_axi_arvalid(eth_master_arvalid),
+  .s_axi_arready(eth_master_m_arready_arready),
+  .s_axi_rdata(eth_master_m_rvalid_rdata), .s_axi_rresp(eth_master_m_rvalid_rresp),
+  .s_axi_rvalid(eth_master_m_rvalid_rvalid), .s_axi_rready(eth_master_rready),
+  .phy_tx_clk(phy_tx_clk), .phy_rx_clk(phy_rx_clk), .phy_crs(phy_crs),
+  .phy_dv(phy_dv), .phy_rx_data(phy_rx_data), .phy_col(phy_col),
+  .phy_rx_er(phy_rx_er), .phy_rst_n(phy_rst_n), .phy_tx_en(phy_tx_en),
+  .phy_tx_data(phy_tx_data), .phy_mdio_i(phy_mdio_i), .phy_mdio_o(phy_mdio_o),
+  .phy_mdio_t(phy_mdio_t), .phy_mdc(phy_mdc)
+);
+
+xadc_wiz_0 xadc_wiz_inst (
+        .s_axi_aclk(core_clk), .s_axi_aresetn(~soc_reset),
+        .s_axi_awaddr(xadc_master_awaddr), .s_axi_awvalid(xadc_master_awvalid),
+        .s_axi_awready(xadc_master_m_awready_awready),
+        .s_axi_wdata(xadc_master_wdata), .s_axi_wstrb(xadc_master_wstrb),
+        .s_axi_wvalid(xadc_master_wvalid), .s_axi_wready(xadc_master_m_wready_wready),
+        .s_axi_bresp(xadc_master_m_bvalid_bresp), .s_axi_bvalid(xadc_master_m_bvalid_bvalid),
+        .s_axi_bready(xadc_master_bready),
+        .s_axi_araddr(xadc_master_araddr), .s_axi_arvalid(xadc_master_arvalid),
+        .s_axi_arready(xadc_master_m_arready_arready),
+        .s_axi_rdata(xadc_master_m_rvalid_rdata), .s_axi_rresp(xadc_master_m_rvalid_rresp),
+        .s_axi_rvalid(xadc_master_m_rvalid_rvalid), .s_axi_rready(xadc_master_rready),
+        .vauxp0(vauxp0), .vauxn0(vauxn0), .vauxp4(vauxp4), .vauxn4(vauxn4),
+        .vauxp5(vauxp5), .vauxn5(vauxn5), .vauxp6(vauxp6), .vauxn6(vauxn6),
+        .vauxp7(vauxp7), .vauxn7(vauxn7), .vauxp12(vauxp12), .vauxn12(vauxn12),
+        .vauxp13(vauxp13), .vauxn13(vauxn13), .vauxp14(vauxp14), .vauxn14(vauxn14),
+        .vauxp15(vauxp15), .vauxn15(vauxn15), .vp_in(vp_in), .vn_in(vn_in),
+        .temp_out(device_temp), .ip2intc_irpt(xadc_ip2intc_irpt)
+);
+
+  // [CHANGED] 3-bit: bit[2]=radar_irq bit[1]=eth bit[0]=xadc
+  assign interrupts = {radar_irq, eth10_ip2intc_irpt, xadc_ip2intc_irpt};
+
+// ================================================================
+// [RADAR] Instantiate Radar ADAS v3.0
+//   Base address: 0x0004_0600 (AXI4LiteBase in Soc.defines)
+//   Address decode: lower 10 bits [9:0] used as register offset
+//   UART_BIT_PERIOD = 868 → 115200 baud at 100 MHz core clock
+// ================================================================
+radar_adas_v5_axi4lite_v3 #(
+    .C_S_AXI_DATA_WIDTH (32),
+    .C_S_AXI_ADDR_WIDTH (10),
+    .N_FEATURES         (59),
+    .DEF_PED_THRESH_CM  (300),
+    .DEF_VEH_THRESH_CM  (600),
+    .DEF_STA_THRESH_CM  (150),
+    .DEF_RPM_IDLE_THR   (5),
+    .DEF_RPM_MOVE_THR   (90),
+    .UART_BIT_PERIOD    (868),   // 100_000_000 / 115200 = 868 clocks/bit
+    .TURN_DURATION      (50_000_000),   // 0.5 s lane-change turn phase
+    .HOLD_DURATION      (30_000_000),   // 0.3 s straight hold between turns
+    .CORRECT_DURATION   (30_000_000)    // 0.3 s corrective counter-steer
+) radar_ip (
+    .s_axi_aclk    (core_clk),
+    .s_axi_aresetn (~soc_reset),
+    // AXI4-Lite slave (address lower 10 bits)
+    .s_axi_awaddr  (axi4lite_master_awaddr[9:0]),
+    .s_axi_awprot  (3'b0),
+    .s_axi_awvalid (axi4lite_master_awvalid),
+    .s_axi_awready (axi4lite_master_awready),
+    .s_axi_wdata   (axi4lite_master_wdata),
+    .s_axi_wstrb   (axi4lite_master_wstrb),
+    .s_axi_wvalid  (axi4lite_master_wvalid),
+    .s_axi_wready  (axi4lite_master_wready),
+    .s_axi_bresp   (axi4lite_master_bresp),
+    .s_axi_bvalid  (axi4lite_master_bvalid),
+    .s_axi_bready  (axi4lite_master_bready),
+    .s_axi_araddr  (axi4lite_master_araddr[9:0]),
+    .s_axi_arprot  (3'b0),
+    .s_axi_arvalid (axi4lite_master_arvalid),
+    .s_axi_arready (axi4lite_master_arready),
+    .s_axi_rdata   (axi4lite_master_rdata),
+    .s_axi_rresp   (axi4lite_master_rresp),
+    .s_axi_rvalid  (axi4lite_master_rvalid),
+    .s_axi_rready  (axi4lite_master_rready),
+    // Physical ports
+    .uart_rxd      (radar_uart_rxd),   // JA1: IWR6843 UART data out → FPGA in
+    .hall_in       (gpio_8_in),        // gpio_8 / CK_IO[8] / N15: Hall sensor
+    .pwm_l_out     (radar_pwm_l),      // JD7 (E2): L298N ENA
+    .pwm_r_out     (radar_pwm_r),      // JD8 (D2): L298N ENB
+    .in1           (radar_in1),        // JD1 (D4): L298N IN1
+    .in2           (radar_in2),        // JD2 (D3): L298N IN2
+    .in3           (radar_in3),        // JD3 (F4): L298N IN3
+    .in4           (radar_in4),        // JD4 (F3): L298N IN4
+    .buzzer_out    (radar_buzzer),     // JD9 (H2): piezo buzzer
+    .status_led    (radar_status_led), // JD10 (G2): status LED
+    .irq_out       (radar_irq),        // → interrupts[2] → PLIC source 35
+    .sd_sclk       (radar_sd_sclk),   // JA7 (D13): SD SCLK
+    .sd_mosi       (radar_sd_mosi),   // JA3 (A11): SD MOSI
+    .sd_miso       (radar_sd_miso),   // JA4 (D12): SD MISO
+    .sd_cs_n       (radar_sd_cs_n)    // JA2 (B11): SD CS
+);
+
+// ================================================================
+// [RADAR] cfg_sender: Automatically sends ISK_6m_default.cfg
+// to the IWR6843 UART RX port after reset is released.
+//
+// IWR6843 has two UART ports:
+//   - Data port (sensorStop frame output): connected to radar_uart_rxd (JA1)
+//   - Config port (accepts .cfg commands): connected to radar_cfg_tx (JB3)
+//
+// The cfg_sender sends the complete .cfg file contents byte-by-byte
+// at 115200 baud immediately when soc_reset deasserts. After the cfg
+// is sent it idles — no firmware intervention needed.
+// ================================================================
+cfg_sender #(
+    .CLK_HZ       (100_000_000),
+    .BAUD         (115200)
+) cfg_inst (
+    .clk      (core_clk),
+    .rst_n    (~soc_reset),
+    .uart_tx  (radar_cfg_tx)
+);
+
+// ================================================================
+// IOBUF instances (unchanged from original except gpio_24..31 removed)
+// ================================================================
+   IOBUF eth_mdio_inst(.O(phy_mdio_i),.IO(phy_mdio),.I(phy_mdio_o),.T(phy_mdio_t));
+
+   IOBUF i2c0_scl_inst(.O(i2c0_scl_in),.IO(i2c0_scl),.I(i2c0_scl_out),.T(~i2c0_scl_out_en));
+   IOBUF i2c0_sda_inst(.O(i2c0_sda_in),.IO(i2c0_sda),.I(i2c0_sda_out),.T(~i2c0_sda_out_en));
+   IOBUF i2c1_scl_inst(.O(i2c1_scl_in),.IO(i2c1_scl),.I(i2c1_scl_out),.T(~i2c1_scl_out_en));
+   IOBUF i2c1_sda_inst(.O(i2c1_sda_in),.IO(i2c1_sda),.I(i2c1_sda_out),.T(~i2c1_sda_out_en));
+
+   IOBUF io7_cell_inst (.O(io7_cell_in),.IO(io7_cell),.I(io7_cell_out),.T(io7_cell_en));
+   IOBUF io8_cell_inst (.O(io8_cell_in),.IO(io8_cell),.I(io8_cell_out),.T(io8_cell_en));
+   IOBUF io9_cell_inst (.O(io9_cell_in),.IO(io9_cell),.I(io9_cell_out),.T(io9_cell_en));
+   IOBUF io10_cell_inst(.O(io10_cell_in),.IO(io10_cell),.I(io10_cell_out),.T(io10_cell_en));
+   IOBUF io12_cell_inst(.O(io12_cell_in),.IO(io12_cell),.I(io12_cell_out),.T(io12_cell_en));
+   IOBUF io13_cell_inst(.O(io13_cell_in),.IO(io13_cell),.I(io13_cell_out),.T(io13_cell_en));
+   IOBUF io16_cell_inst(.O(io16_cell_in),.IO(io16_cell),.I(io16_cell_out),.T(io16_cell_en));
+   IOBUF io17_cell_inst(.O(io17_cell_in),.IO(io17_cell),.I(io17_cell_out),.T(io17_cell_en));
+   IOBUF io18_cell_inst(.O(io18_cell_in),.IO(io18_cell),.I(io18_cell_out),.T(io18_cell_en));
+   IOBUF io19_cell_inst(.O(io19_cell_in),.IO(io19_cell),.I(io19_cell_out),.T(io19_cell_en));
+   IOBUF io20_cell_inst(.O(io20_cell_in),.IO(io20_cell),.I(io20_cell_out),.T(io20_cell_en));
+
+   IOBUF gpio_4_inst (.O(gpio_4_in),.IO(gpio_4),.I(gpio_4_out),.T(~gpio_4_en));
+   IOBUF gpio_7_inst (.O(gpio_7_in),.IO(gpio_7),.I(gpio_7_out),.T(~gpio_7_en));
+   // gpio_8 is the Hall sensor — configured as input (T=1 always keeps it as input)
+   IOBUF gpio_8_inst (.O(gpio_8_in),.IO(gpio_8),.I(1'b0),.T(1'b1));
+   IOBUF gpio_14_inst(.O(gpio_14_in),.IO(gpio_14),.I(gpio_14_out),.T(~gpio_14_en));
+   IOBUF gpio_15_inst(.O(gpio_15_in),.IO(gpio_15),.I(gpio_15_out),.T(~gpio_15_en));
+   IOBUF gpio_16_inst(.O(gpio_16_in),.IO(gpio_16),.I(gpio_16_out),.T(~gpio_16_en));
+   IOBUF gpio_17_inst(.O(gpio_17_in),.IO(gpio_17),.I(gpio_17_out),.T(~gpio_17_en));
+   IOBUF gpio_18_inst(.O(gpio_18_in),.IO(gpio_18),.I(gpio_18_out),.T(~gpio_18_en));
+   IOBUF gpio_19_inst(.O(gpio_19_in),.IO(gpio_19),.I(gpio_19_out),.T(~gpio_19_en));
+   IOBUF gpio_20_inst(.O(gpio_20_in),.IO(gpio_20),.I(gpio_20_out),.T(~gpio_20_en));
+   IOBUF gpio_21_inst(.O(gpio_21_in),.IO(gpio_21),.I(gpio_21_out),.T(~gpio_21_en));
+   IOBUF gpio_22_inst(.O(gpio_22_in),.IO(gpio_22),.I(gpio_22_out),.T(~gpio_22_en));
+   IOBUF gpio_23_inst(.O(gpio_23_in),.IO(gpio_23),.I(gpio_23_out),.T(~gpio_23_en));
+   // gpio_24..gpio_31: JD now dedicated to radar — IOBUFs removed
+
+   IOBUF spi0_inst_mosi(.O(spi0_io_mosi_in_val),.IO(spi0_mosi),.I(spi0_io_mosi_out),.T(~spi0_io_mosi_outen));
+   IOBUF spi0_inst_miso(.O(spi0_io_miso_in_val),.IO(spi0_miso),.I(spi0_io_miso_out),.T(~spi0_io_miso_outen));
+   IOBUF spi0_inst_nss (.O(spi0_io_nss_in_val),.IO(spi0_nss),.I(spi0_io_nss_out),.T(~spi0_io_nss_outen));
+
+   STARTUPE2 #(.PROG_USR("False"), .SIM_CCLK_FREQ(0.0)) startupe2_inst1(
+               .CFGCLK(), .CFGMCLK(), .EOS(), .PREQ(), .CLK(0),
+               .GSR(0), .GTS(0), .KEYCLEARB(0), .PACK(0),
+               .USRCCLKO(spi0_io_sclk_out), .USRCCLKTS(0),
+               .USRDONEO(1), .USRDONETS(1));
+
+endmodule
+
+// ================================================================
+// cfg_sender: Sends ISK_6m_default.cfg to IWR6843 at 115200 baud
+// Fires once after rst_n asserts, then idles.
+//
+// The .cfg content is stored in a ROM (parameter array).
+// Bytes are sent LSB-first, 8N1, at the configured baud rate.
+// The IWR6843 expects each command terminated with \n (0x0A).
+//
+// To regenerate the ROM bytes from ISK_6m_default.cfg:
+//   python3 gen_cfg_rom.py ISK_6m_default.cfg > cfg_rom_bytes.vh
+// and `include cfg_rom_bytes.vh  OR use the hard-coded bytes below.
+// ================================================================
+module cfg_sender #(
+    parameter integer CLK_HZ = 100_000_000,
+    parameter integer BAUD   = 115200
+)(
+    input  wire clk,
+    input  wire rst_n,
+    output reg  uart_tx
+);
+    // Baud divider: number of clocks per bit
+    localparam integer BIT_PERIOD = CLK_HZ / BAUD;  // 868 at 100 MHz/115200
+
+    // ── CONFIG ROM ──────────────────────────────────────────────────────────
+    // Generated from ISK_6m_default.cfg
+    // Each entry is one ASCII byte of the .cfg file.
+    // \n = 8'h0A terminates each line (required by IWR6843 CLI).
+    // Includes sensorStop at start and sensorStart at end.
+    // ────────────────────────────────────────────────────────────────────────
+    localparam integer CFG_LEN = 1017;  // bytes from ISK_6m_default.cfg (commands only, LF-terminated)
+
+    // ROM stored as a packed array
+    reg [7:0] cfg_rom [0:CFG_LEN-1];
+    integer i_init;
+    initial begin
+        // The cfg file content is loaded from an external hex file.
+        // Place cfg_rom.hex in the same directory as this Verilog file.
+        // To generate: python3 gen_cfg_rom.py ISK_6m_default.cfg cfg_rom.hex
+        $readmemh("cfg_rom.hex", cfg_rom);
+    end
+
+    // ── State machine ────────────────────────────────────────────────────────
+    localparam S_IDLE    = 2'd0;
+    localparam S_START   = 2'd1;   // send start bit
+    localparam S_DATA    = 2'd2;   // send 8 data bits
+    localparam S_STOP    = 2'd3;   // send stop bit
+
+    reg [1:0]  state;
+    reg [31:0] baud_cnt;
+    reg [2:0]  bit_idx;     // 0-7 data bits
+    reg [31:0] rom_idx;     // current byte in cfg_rom
+    reg [7:0]  tx_shift;    // current byte being shifted out
+    reg        done;        // all bytes sent
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state    <= S_IDLE;
+            baud_cnt <= 0;
+            bit_idx  <= 0;
+            rom_idx  <= 0;
+            tx_shift <= 8'hFF;
+            uart_tx  <= 1'b1;  // idle high
+            done     <= 1'b0;
+        end else begin
+            case (state)
+
+                S_IDLE: begin
+                    uart_tx <= 1'b1;
+                    if (!done) begin
+                        // Start sending immediately after reset
+                        tx_shift <= cfg_rom[0];
+                        rom_idx  <= 0;
+                        baud_cnt <= 0;
+                        bit_idx  <= 0;
+                        state    <= S_START;
+                    end
+                end
+
+                S_START: begin
+                    uart_tx <= 1'b0;   // start bit
+                    if (baud_cnt >= BIT_PERIOD - 1) begin
+                        baud_cnt <= 0;
+                        bit_idx  <= 0;
+                        state    <= S_DATA;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                S_DATA: begin
+                    uart_tx <= tx_shift[bit_idx];   // LSB first
+                    if (baud_cnt >= BIT_PERIOD - 1) begin
+                        baud_cnt <= 0;
+                        if (bit_idx == 3'd7) begin
+                            bit_idx <= 0;
+                            state   <= S_STOP;
+                        end else
+                            bit_idx <= bit_idx + 1;
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                S_STOP: begin
+                    uart_tx <= 1'b1;   // stop bit
+                    if (baud_cnt >= BIT_PERIOD - 1) begin
+                        baud_cnt <= 0;
+                        if (rom_idx >= CFG_LEN - 1) begin
+                            // All bytes sent — stay idle
+                            done  <= 1'b1;
+                            state <= S_IDLE;
+                        end else begin
+                            rom_idx  <= rom_idx + 1;
+                            tx_shift <= cfg_rom[rom_idx + 1];
+                            state    <= S_START;
+                        end
+                    end else
+                        baud_cnt <= baud_cnt + 1;
+                end
+
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
