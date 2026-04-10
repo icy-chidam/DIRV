@@ -1,0 +1,1317 @@
+// =============================================================================
+//  radar_adas_v5_axi4lite_v3.v  —  v3.0
+//  RadarShield ADAS — Single L298N driver (series motor wiring)
+//
+//  KEY CHANGES FROM v2.0:
+//  ─────────────────────
+//  [1] SINGLE L298N DRIVER — SERIES MOTOR WIRING
+//      One L298N drives both sides:
+//        OUT1/OUT2 → Left  side: 2 motors wired in series
+//        OUT3/OUT4 → Right side: 2 motors wired in series
+//      ENA (PMOD JC[0]) → pwm_l_out  — left  side speed
+//      ENB (PMOD JC[1]) → pwm_r_out  — right side speed
+//      IN1 (JD[1]) IN2 (JD[2])       — left  side direction
+//      IN3 (JD[3]) IN4 (JD[4])       — right side direction
+//
+//  [2] LANE-CHANGE STEERING LOGIC (not continuous turning)
+//      Steering has 3 phases:
+//        PHASE_TURN  : reduce one side PWM for TURN_DURATION clocks  (~0.5 s)
+//        PHASE_HOLD  : full speed straight for HOLD_DURATION clocks   (~0.3 s)
+//        PHASE_CORRECT: reduce opposite side to re-centre             (~0.3 s)
+//        PHASE_STRAIGHT: back to equal duty
+//      x_mean < 0 → object LEFT  → steer RIGHT (reduce left  motor)
+//      x_mean > 0 → object RIGHT → steer LEFT  (reduce right motor)
+//      After PHASE_CORRECT completes → state_machine returns to STRAIGHT
+//      New steering command accepted only after full sequence completes
+//      OR when object is gone (no alert)
+//
+//  [3] BUZZER PATTERNS (PWM-driven for passive piezo)
+//      5–7 m  : CONTINUOUS   2 kHz tone  (PWM at 2 kHz, 50% duty)
+//      3–5 m  : DISCRETE     2 kHz tone  (250 ms ON / 250 ms OFF)
+//      < 3 m  : RAPID        4 kHz tone  (100 ms ON / 100 ms OFF)
+//      > 7 m  : OFF
+//
+//  [4] STATUS LED  — PMOD JD[5]
+//      ON whenever alert is active (any class within threshold)
+//      Blinks at 1 Hz when object detected but outside threshold
+//      OFF when no valid detection
+//
+//  [5] SD CARD SPI — unchanged from v2.0
+//
+//  ML MODEL NOTE:
+//  ─────────────
+//  GBM v5 classifies WHAT (ped/sta/veh). The steering uses WHERE (x_mean).
+//  x_mean is Q16.16 (metres). Positive = object to the right of boresight.
+//  No new training column needed for left/right — it is pure geometry.
+//  The firmware column in the log record captures steer_state (0/1/2)
+//  for post-analysis if desired.
+//
+//  PMOD ASSIGNMENT:
+//  ────────────────
+//  JA[0]  uart_rxd    IWR6843 data port TX
+//  JA[1]  sd_cs_n     SD card chip-select (active LOW)
+//  JA[2]  sd_mosi     SD card MOSI
+//  JA[3]  sd_miso     SD card MISO
+//  JA[4]  sd_sclk     SD card clock
+//  JB[0]  hall_in     A3144 Hall sensor
+//  JC[0]  pwm_l_out   ENA → L298N left  motors (series pair)
+//  JC[1]  pwm_r_out   ENB → L298N right motors (series pair)
+//  JD[0]  buzzer_out  Piezo buzzer (PWM driven)
+//  JD[1]  in1         L298N IN1 (left  side forward)
+//  JD[2]  in2         L298N IN2 (left  side reverse/brake)
+//  JD[3]  in3         L298N IN3 (right side forward)
+//  JD[4]  in4         L298N IN4 (right side reverse/brake)
+//  JD[5]  status_led  Single status LED (active HIGH)
+//
+//  L298N WIRING (single driver, series motors):
+//  ─────────────────────────────────────────────
+//  ENA ─── JC[0] (pwm_l_out)       ENB ─── JC[1] (pwm_r_out)
+//  IN1 ─── JD[1]                   IN3 ─── JD[3]
+//  IN2 ─── JD[2]                   IN4 ─── JD[4]
+//  OUT1 ─── Motor L_Front (+)      OUT3 ─── Motor R_Front (+)
+//  OUT2 ─── Motor L_Front (−) ─── Motor L_Rear (+)   (series)
+//           Motor L_Rear  (−) ─── GND
+//  OUT3 and OUT4 similarly for right side
+//
+//  AXI4-Lite BASE: 0x00040400 (matches Shakti Yamuna Soc.defines AXI4LiteBase)
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+`default_nettype none
+
+module radar_adas_v5_axi4lite_v3 #(
+    parameter integer C_S_AXI_DATA_WIDTH  = 32,
+    parameter integer C_S_AXI_ADDR_WIDTH  = 10,
+    parameter integer N_FEATURES          = 59,
+    parameter integer DEF_PED_THRESH_CM   = 300,
+    parameter integer DEF_VEH_THRESH_CM   = 600,
+    parameter integer DEF_STA_THRESH_CM   = 150,
+    parameter integer DEF_RPM_IDLE_THR    = 5,
+    parameter integer DEF_RPM_MOVE_THR    = 90,
+    // 100 MHz / 115200 baud = 868 clocks
+    parameter integer UART_BIT_PERIOD     = 868,
+    // Lane-change timing at 100 MHz
+    // TURN phase: 0.5 s  = 50_000_000 clocks
+    parameter integer TURN_DURATION       = 50_000_000,
+    // HOLD phase: 0.3 s  = 30_000_000 clocks (straight between turn & correction)
+    parameter integer HOLD_DURATION       = 30_000_000,
+    // CORRECT phase: 0.3 s = 30_000_000 clocks (counter-steer to re-centre)
+    parameter integer CORRECT_DURATION    = 30_000_000
+)(
+    // AXI4-Lite slave
+    input  wire                              s_axi_aclk,
+    input  wire                              s_axi_aresetn,
+    input  wire [C_S_AXI_ADDR_WIDTH-1:0]    s_axi_awaddr,
+    input  wire [2:0]                        s_axi_awprot,
+    input  wire                              s_axi_awvalid,
+    output wire                              s_axi_awready,
+    input  wire [C_S_AXI_DATA_WIDTH-1:0]    s_axi_wdata,
+    input  wire [C_S_AXI_DATA_WIDTH/8-1:0]  s_axi_wstrb,
+    input  wire                              s_axi_wvalid,
+    output wire                              s_axi_wready,
+    output wire [1:0]                        s_axi_bresp,
+    output wire                              s_axi_bvalid,
+    input  wire                              s_axi_bready,
+    input  wire [C_S_AXI_ADDR_WIDTH-1:0]    s_axi_araddr,
+    input  wire [2:0]                        s_axi_arprot,
+    input  wire                              s_axi_arvalid,
+    output wire                              s_axi_arready,
+    output wire [C_S_AXI_DATA_WIDTH-1:0]    s_axi_rdata,
+    output wire [1:0]                        s_axi_rresp,
+    output wire                              s_axi_rvalid,
+    input  wire                              s_axi_rready,
+    // Physical I/O
+    input  wire                              uart_rxd,    // IWR6843 UART
+    input  wire                              hall_in,     // Hall sensor
+    // Dual PWM (ENA / ENB for L298N)
+    output wire                              pwm_l_out,   // ENA left  side
+    output wire                              pwm_r_out,   // ENB right side
+    // Direction pins IN1–IN4
+    output wire                              in1,         // L298N IN1
+    output wire                              in2,         // L298N IN2
+    output wire                              in3,         // L298N IN3
+    output wire                              in4,         // L298N IN4
+    // Buzzer (PWM-driven passive piezo)
+    output wire                              buzzer_out,
+    // Single status LED
+    output wire                              status_led,
+    // IRQ to Shakti PLIC
+    output wire                              irq_out,
+    // SD card SPI
+    output wire                              sd_sclk,
+    output wire                              sd_mosi,
+    input  wire                              sd_miso,
+    output wire                              sd_cs_n
+);
+
+    // =========================================================================
+    // SECTION 1: ML Threshold Constants (Q16.16 = float × 65536)
+    // =========================================================================
+    localparam signed [31:0] TH_Z_MEAN_0p3   =  32'd19661;
+    localparam signed [31:0] TH_Z_MEAN_0p5   =  32'd34078;
+    localparam signed [31:0] TH_Z_MEAN_1p1   =  32'd72401;
+    localparam signed [31:0] TH_Z_MEAN_2p1   =  32'd137168;
+    localparam signed [31:0] TH_Z_STD_0p05   =  32'd3584;
+    localparam signed [31:0] TH_Z_STD_0p07   =  32'd4645;
+    localparam signed [31:0] TH_Z_RANGE_0p18 =  32'd11731;
+    localparam signed [31:0] TH_Z_RANGE_2p5  =  32'd166182;
+    localparam signed [31:0] TH_ZSPREAD_0p23 =  32'd15244;
+    localparam signed [31:0] TH_NZC_0p10     =  32'd6554;
+    localparam signed [31:0] TH_NZC_0p15     =  32'd9830;
+    localparam signed [31:0] TH_NZC_0p31     =  32'd20618;
+    localparam        [31:0] TH_SNR_MAX_15   =  32'd983040;
+    localparam signed [31:0] TH_SZFP_12      =  32'd786432;
+    localparam signed [31:0] TH_SZFP_18      =  32'd1189282;
+    localparam signed [31:0] TH_SZFP_19      =  32'd1300562;
+    localparam        [31:0] TH_NPTS_3       =  32'd229376;
+    localparam        [31:0] TH_NPTS_12      =  32'd819200;
+    localparam        [31:0] TH_NPTS_64      =  32'd4227072;
+    localparam signed [31:0] TH_ZFRAC_0p5    =  32'd32768;
+    localparam signed [31:0] TH_ZFRAC_0p99   =  32'd64875;
+    localparam signed [31:0] TH_HS2_LOW      =  32'd3120;
+    localparam signed [31:0] TH_HS2_HIGH     =  32'd23776;
+    localparam signed [31:0] TH_VSC_LOW      =  32'd1081;
+    localparam signed [31:0] TH_VSC_HIGH     =  32'd19333;
+    localparam signed [31:0] TH_BGF_0p5      =  32'd32768;
+    localparam signed [31:0] TH_STT_57       =  32'd3736797;
+    localparam signed [31:0] TH_STT_71       =  32'd4665999;
+
+    // Steering x_mean thresholds (Q16.16)
+    // 0.15 m → center band (no steer)
+    localparam signed [31:0] TH_CENTER_BAND  =  32'd9830;
+    // 0.30 m → soft steer (20% duty reduction on turn side)
+    localparam signed [31:0] TH_STEER_SOFT   =  32'd19660;
+    // 0.80 m → hard steer (40% duty reduction on turn side)
+    localparam signed [31:0] TH_STEER_HARD   =  32'd52428;
+
+    // =========================================================================
+    // SECTION 2: PWM / Buzzer / Timing Constants
+    // =========================================================================
+    localparam CLK_HZ        = 32'd100_000_000;
+    // 20 kHz PWM: period = 100e6 / 20e3 = 5000 counts
+    localparam PWM_PERIOD    = 13'd5000;
+    localparam DUTY_100      = 13'd5000;
+    localparam DUTY_80       = 13'd4000;   // 20% reduction (soft steer)
+    localparam DUTY_60       = 13'd3000;   // 40% reduction (hard steer)
+    localparam DUTY_50       = 13'd2500;
+    localparam DUTY_20       = 13'd1000;
+    localparam DUTY_0        = 13'd0;
+
+    // Buzzer half-periods at 100 MHz
+    localparam BUZZ_HALF_2K  = 17'd25000;  // 2 kHz: half = 25000 clocks
+    localparam BUZZ_HALF_4K  = 17'd12500;  // 4 kHz: half = 12500 clocks
+
+    // Buzzer pattern ON/OFF periods
+    localparam BUZZ_DISCRETE_ON  = 32'd25_000_000;  // 250 ms
+    localparam BUZZ_DISCRETE_OFF = 32'd25_000_000;  // 250 ms
+    localparam BUZZ_RAPID_ON     = 32'd10_000_000;  // 100 ms
+    localparam BUZZ_RAPID_OFF    = 32'd10_000_000;  // 100 ms
+
+    // Alert range thresholds (cm)
+    localparam RANGE_7M      = 16'd700;
+    localparam RANGE_5M      = 16'd500;
+    localparam RANGE_3M      = 16'd300;
+
+    // LED blink: 1 Hz → toggle every 50_000_000 clocks
+    localparam LED_BLINK_HALF = 32'd50_000_000;
+
+    // SPI clock divider
+    localparam SPI_CLK_DIV   = 6'd12;
+
+    // Lane-change state machine states
+    localparam [2:0] LC_STRAIGHT = 3'd0;
+    localparam [2:0] LC_TURN     = 3'd1;  // steer away from object
+    localparam [2:0] LC_HOLD     = 3'd2;  // straight momentarily
+    localparam [2:0] LC_CORRECT  = 3'd3;  // counter-steer to re-centre
+    localparam [2:0] LC_DONE     = 3'd4;  // lane change complete
+
+    // =========================================================================
+    // SECTION 3: AXI Register Declarations
+    // =========================================================================
+    reg         reg_start_manual, reg_soft_reset, reg_auto_infer_en;
+    reg         reg_done, reg_alert, reg_busy, reg_valid;
+    reg [1:0]   reg_class_out;
+    reg [6:0]   reg_confidence;
+    reg [15:0]  reg_range_cm;
+    reg [15:0]  reg_thresh_ped, reg_thresh_veh, reg_thresh_sta;
+    reg [1:0]   reg_irq_status, reg_irq_enable;
+    reg [15:0]  reg_score_ped, reg_score_sta, reg_score_veh;
+    reg [1:0]   reg_alert_class;
+    reg [15:0]  reg_obj_vel_cms;
+    reg signed [31:0] feat [0:N_FEATURES-1];
+    reg [7:0]   reg_pwm_manual_duty;
+    reg         reg_pwm_force_manual, reg_pwm_en;
+    reg         reg_buzzer_force_on, reg_buzzer_disable;
+    reg [15:0]  reg_rpm_idle_thr, reg_rpm_move_thr;
+    reg         reg_uart_rx_enable, reg_uart_flush;
+    reg [1:0]   reg_irq_clear_req;
+    reg         reg_irq_clear_valid;
+    // Steering registers
+    reg [15:0]  reg_steer_soft_thr;   // default 0x4CCC = 0.30 m
+    reg [15:0]  reg_steer_hard_thr;   // default 0xCCCC = 0.80 m
+    // SPI registers
+    reg         reg_spi_en, reg_spi_cs_n;
+    reg [5:0]   reg_spi_clk_div;
+    reg [7:0]   reg_spi_tx_data;
+    reg         reg_spi_tx_req;
+    reg [7:0]   reg_spi_rx_data;
+    reg         reg_spi_rx_ready;
+
+    // =========================================================================
+    // SECTION 4: AXI4-Lite Handshake
+    // =========================================================================
+    reg        axi_awready_r, axi_wready_r, axi_bvalid_r;
+    reg        axi_arready_r, axi_rvalid_r;
+    reg [C_S_AXI_DATA_WIDTH-1:0] axi_rdata_r;
+    reg [C_S_AXI_ADDR_WIDTH-1:0] axi_awaddr_r, axi_araddr_r;
+
+    assign s_axi_awready = axi_awready_r;
+    assign s_axi_wready  = axi_wready_r;
+    assign s_axi_bresp   = 2'b00;
+    assign s_axi_bvalid  = axi_bvalid_r;
+    assign s_axi_arready = axi_arready_r;
+    assign s_axi_rdata   = axi_rdata_r;
+    assign s_axi_rresp   = 2'b00;
+    assign s_axi_rvalid  = axi_rvalid_r;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) axi_awready_r <= 1'b0;
+        else begin
+            axi_awready_r <= (!axi_awready_r && s_axi_awvalid && s_axi_wvalid) ? 1'b1 : 1'b0;
+            if (!axi_awready_r && s_axi_awvalid && s_axi_wvalid)
+                axi_awaddr_r <= s_axi_awaddr;
+        end
+    end
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) axi_wready_r <= 1'b0;
+        else axi_wready_r <= (!axi_wready_r && s_axi_wvalid && s_axi_awvalid) ? 1'b1 : 1'b0;
+    end
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) axi_bvalid_r <= 1'b0;
+        else if (axi_awready_r && s_axi_awvalid && axi_wready_r && s_axi_wvalid && !axi_bvalid_r)
+            axi_bvalid_r <= 1'b1;
+        else if (s_axi_bready && axi_bvalid_r) axi_bvalid_r <= 1'b0;
+    end
+
+    wire wr_en   = axi_awready_r && s_axi_awvalid && axi_wready_r && s_axi_wvalid;
+    wire [9:0] wr_addr = axi_awaddr_r[9:0];
+    integer fi_rst;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || reg_soft_reset) begin
+            reg_start_manual    <= 1'b0;
+            reg_soft_reset      <= 1'b0;
+            reg_auto_infer_en   <= 1'b1;
+            reg_thresh_ped      <= DEF_PED_THRESH_CM[15:0];
+            reg_thresh_veh      <= DEF_VEH_THRESH_CM[15:0];
+            reg_thresh_sta      <= DEF_STA_THRESH_CM[15:0];
+            reg_irq_enable      <= 2'b00;
+            reg_pwm_manual_duty <= 8'd100;
+            reg_pwm_force_manual<= 1'b0;
+            reg_pwm_en          <= 1'b1;
+            reg_buzzer_force_on <= 1'b0;
+            reg_buzzer_disable  <= 1'b0;
+            reg_rpm_idle_thr    <= DEF_RPM_IDLE_THR[15:0];
+            reg_rpm_move_thr    <= DEF_RPM_MOVE_THR[15:0];
+            reg_uart_rx_enable  <= 1'b1;
+            reg_uart_flush      <= 1'b0;
+            reg_irq_clear_req   <= 2'b00;
+            reg_irq_clear_valid <= 1'b0;
+            reg_steer_soft_thr  <= 16'h4CCC;
+            reg_steer_hard_thr  <= 16'hCCCC;
+            reg_spi_en          <= 1'b0;
+            reg_spi_cs_n        <= 1'b1;
+            reg_spi_clk_div     <= SPI_CLK_DIV[5:0];
+            reg_spi_tx_req      <= 1'b0;
+            for (fi_rst = 0; fi_rst < N_FEATURES; fi_rst = fi_rst+1)
+                feat[fi_rst] <= 32'd0;
+        end else begin
+            reg_start_manual    <= 1'b0;
+            reg_uart_flush      <= 1'b0;
+            reg_irq_clear_valid <= 1'b0;
+            reg_spi_tx_req      <= 1'b0;
+            if (wr_en) begin
+                casez (wr_addr)
+                    10'h000: begin
+                        reg_start_manual  <= s_axi_wdata[0];
+                        reg_soft_reset    <= s_axi_wdata[1];
+                        reg_auto_infer_en <= s_axi_wdata[2];
+                    end
+                    10'h014: reg_thresh_ped <= s_axi_wdata[15:0];
+                    10'h018: reg_thresh_veh <= s_axi_wdata[15:0];
+                    10'h01C: reg_thresh_sta <= s_axi_wdata[15:0];
+                    10'h020: begin
+                        reg_irq_clear_req   <= s_axi_wdata[1:0];
+                        reg_irq_clear_valid <= 1'b1;
+                    end
+                    10'h024: reg_irq_enable <= s_axi_wdata[1:0];
+                    10'h180: begin
+                        reg_pwm_manual_duty  <= s_axi_wdata[7:0];
+                        reg_pwm_force_manual <= s_axi_wdata[8];
+                        reg_pwm_en           <= s_axi_wdata[9];
+                    end
+                    10'h184: begin
+                        reg_buzzer_force_on <= s_axi_wdata[0];
+                        reg_buzzer_disable  <= s_axi_wdata[1];
+                    end
+                    10'h18C: begin
+                        reg_rpm_idle_thr <= s_axi_wdata[15:0];
+                        reg_rpm_move_thr <= s_axi_wdata[31:16];
+                    end
+                    10'h1A8: begin
+                        reg_uart_rx_enable <= s_axi_wdata[0];
+                        reg_uart_flush     <= s_axi_wdata[1];
+                    end
+                    10'h1B4: begin
+                        reg_steer_soft_thr <= s_axi_wdata[15:0];
+                        reg_steer_hard_thr <= s_axi_wdata[31:16];
+                    end
+                    10'h1B8: begin
+                        reg_spi_tx_data <= s_axi_wdata[7:0];
+                        reg_spi_tx_req  <= 1'b1;
+                    end
+                    10'h1C0: begin
+                        reg_spi_en      <= s_axi_wdata[0];
+                        reg_spi_cs_n    <= s_axi_wdata[1];
+                        reg_spi_clk_div <= s_axi_wdata[7:2];
+                    end
+                    default: ;
+                endcase
+            end
+        end
+    end
+
+    // AXI Read path
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin axi_arready_r <= 1'b0; end
+        else begin
+            axi_arready_r <= (!axi_arready_r && s_axi_arvalid) ? 1'b1 : 1'b0;
+            if (!axi_arready_r && s_axi_arvalid) axi_araddr_r <= s_axi_araddr;
+        end
+    end
+
+    wire [9:0] rd_addr = axi_araddr_r[9:0];
+    wire [1:0] range_zone_w =
+        (reg_range_cm > RANGE_7M) ? 2'd0 :
+        (reg_range_cm > RANGE_5M) ? 2'd1 :
+        (reg_range_cm > RANGE_3M) ? 2'd2 : 2'd3;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin axi_rvalid_r <= 1'b0; axi_rdata_r <= 32'd0; end
+        else if (axi_arready_r && s_axi_arvalid && !axi_rvalid_r) begin
+            axi_rvalid_r <= 1'b1;
+            casez (rd_addr)
+                10'h000: axi_rdata_r <= {29'h0, reg_auto_infer_en, reg_soft_reset, reg_start_manual};
+                10'h004: axi_rdata_r <= {27'h0, uart_rx_active_r, reg_valid, reg_busy, reg_alert, reg_done};
+                10'h008: axi_rdata_r <= {30'h0, reg_class_out};
+                10'h00C: axi_rdata_r <= {25'h0, reg_confidence};
+                10'h010: axi_rdata_r <= {16'h0, reg_range_cm};
+                10'h014: axi_rdata_r <= {16'h0, reg_thresh_ped};
+                10'h018: axi_rdata_r <= {16'h0, reg_thresh_veh};
+                10'h01C: axi_rdata_r <= {16'h0, reg_thresh_sta};
+                10'h020: axi_rdata_r <= {30'h0, reg_irq_status};
+                10'h024: axi_rdata_r <= {30'h0, reg_irq_enable};
+                10'h028: axi_rdata_r <= {16'h0, reg_score_ped};
+                10'h02C: axi_rdata_r <= {16'h0, reg_score_sta};
+                10'h030: axi_rdata_r <= {16'h0, reg_score_veh};
+                10'h034: axi_rdata_r <= 32'h0003_0000;   // VERSION v3.0
+                10'h038: axi_rdata_r <= {30'h0, reg_alert_class};
+                10'h03C: axi_rdata_r <= {16'h0, reg_obj_vel_cms};
+                10'h180: axi_rdata_r <= {22'h0, reg_pwm_en, reg_pwm_force_manual, reg_pwm_manual_duty};
+                10'h184: axi_rdata_r <= {30'h0, reg_buzzer_disable, reg_buzzer_force_on};
+                10'h188: axi_rdata_r <= {16'h0, rpm_reg};
+                10'h18C: axi_rdata_r <= {reg_rpm_move_thr, reg_rpm_idle_thr};
+                10'h190: axi_rdata_r <= {30'h0, range_zone_w};
+                10'h194: axi_rdata_r <= {27'h0, pwm_l_out_r, buzzer_gated_r,
+                                          alert_active_r, is_moving_r, is_idle_r};
+                10'h1A0: axi_rdata_r <= {24'h0, parse_err_r, frame_valid_r, num_pts_r};
+                10'h1A4: axi_rdata_r <= frame_count_r;
+                10'h1A8: axi_rdata_r <= {30'h0, reg_uart_flush, reg_uart_rx_enable};
+                // Steering: [7:3]=lc_state [2]=steer_dir [1:0]=steer_state
+                10'h1B0: axi_rdata_r <= {24'h0, lc_state_r, steer_dir_r, steer_state_r};
+                10'h1B4: axi_rdata_r <= {reg_steer_hard_thr, reg_steer_soft_thr};
+                10'h1BC: axi_rdata_r <= {23'h0, reg_spi_rx_ready, reg_spi_rx_data};
+                10'h1C0: axi_rdata_r <= {24'h0, reg_spi_clk_div, reg_spi_cs_n, reg_spi_en};
+                default:
+                    if (rd_addr >= 10'h040 && rd_addr <= 10'h17C)
+                        axi_rdata_r <= feat[(rd_addr - 10'h040) >> 2];
+                    else axi_rdata_r <= 32'hDEAD_BEEF;
+            endcase
+        end else if (axi_rvalid_r && s_axi_rready) axi_rvalid_r <= 1'b0;
+    end
+
+    // =========================================================================
+    // SECTION 5: UART RX Engine (115200 baud, 8N1)
+    // =========================================================================
+    reg [9:0]  uart_baud_cnt;
+    reg [3:0]  uart_bit_cnt;
+    reg [7:0]  uart_shift_reg;
+    reg        uart_rx_busy;
+    reg        uart_byte_valid;
+    reg [7:0]  uart_byte_out;
+    reg        uart_rxd_sync1, uart_rxd_sync2;
+    reg        uart_rx_active_r;
+
+    always @(posedge s_axi_aclk) begin
+        uart_rxd_sync1 <= uart_rxd; uart_rxd_sync2 <= uart_rxd_sync1;
+    end
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || !reg_uart_rx_enable) begin
+            uart_baud_cnt <= 0; uart_bit_cnt <= 0;
+            uart_rx_busy <= 0; uart_byte_valid <= 0; uart_rx_active_r <= 0;
+        end else begin
+            uart_byte_valid <= 1'b0;
+            if (!uart_rx_busy) begin
+                if (!uart_rxd_sync2) begin
+                    uart_rx_busy  <= 1'b1;
+                    uart_baud_cnt <= UART_BIT_PERIOD[9:0] >> 1;
+                    uart_bit_cnt  <= 4'd0;
+                    uart_rx_active_r <= 1'b1;
+                end
+            end else begin
+                if (uart_baud_cnt == 10'd0) begin
+                    uart_baud_cnt <= UART_BIT_PERIOD[9:0] - 1;
+                    if (uart_bit_cnt < 4'd8) begin
+                        uart_shift_reg <= {uart_rxd_sync2, uart_shift_reg[7:1]};
+                        uart_bit_cnt   <= uart_bit_cnt + 1;
+                    end else begin
+                        uart_byte_valid <= 1'b1;
+                        uart_byte_out   <= uart_shift_reg;
+                        uart_rx_busy    <= 1'b0;
+                        uart_bit_cnt    <= 4'd0;
+                    end
+                end else uart_baud_cnt <= uart_baud_cnt - 1;
+            end
+        end
+    end
+
+    // =========================================================================
+    // SECTION 6: TLV Frame Parser (IWR6843 point-cloud protocol)
+    // =========================================================================
+    localparam MAGIC0=8'h02, MAGIC1=8'h01, MAGIC2=8'h04, MAGIC3=8'h03,
+               MAGIC4=8'h06, MAGIC5=8'h05, MAGIC6=8'h08, MAGIC7=8'h07;
+
+    localparam [6:0]
+        S_M0=0, S_M1=1, S_M2=2, S_M3=3, S_M4=4, S_M5=5, S_M6=6, S_M7=7,
+        S_HDR_VER=8,   S_HDR_PKT=12, S_HDR_PLAT=16, S_HDR_FNO=20,
+        S_HDR_TIME=24, S_HDR_NOBJ=28, S_HDR_NTLV=32, S_HDR_SUBFNO=36,
+        S_TLV_TYPE=40, S_TLV_LEN=44, S_TLV_PAY=48, S_DONE=64;
+
+    reg [6:0]  parse_state;
+    reg [3:0]  hdr_byte_cnt;
+    reg [15:0] num_detected_obj, tlv_len, tlv_bytes_left;
+    reg [7:0]  num_tlvs, tlv_type;
+    reg [3:0]  point_byte_cnt;
+    reg [5:0]  num_pts_r;
+    reg        frame_valid_r, parse_err_r, feat_compute_req;
+    reg [31:0] frame_count_r;
+    reg [31:0] acc_n;
+    reg signed [47:0] acc_x, acc_y, acc_z;
+    reg [47:0] acc_snr, acc_range, acc_above_z, acc_z2;
+    reg signed [15:0] min_x,max_x,min_y,max_y,min_z,max_z;
+    reg [15:0] min_snr,max_snr,min_range,max_range;
+    reg signed [15:0] min_dop, max_dop;
+    reg signed [15:0] pt_range_idx, pt_doppler;
+    reg [15:0] pt_peak, pt_range_cm_lo, pt_range_cm_hi;
+    reg signed [15:0] pt_x, pt_y, pt_z;
+
+    task reset_frame_acc;
+        begin
+            acc_n=0; acc_x=0; acc_y=0; acc_z=0; acc_snr=0;
+            acc_range=0; acc_above_z=0; acc_z2=0;
+            min_x=16'h7FFF; max_x=-16'h7FFF;
+            min_y=16'h7FFF; max_y=-16'h7FFF;
+            min_z=16'h7FFF; max_z=-16'h7FFF;
+            min_snr=16'hFFFF; max_snr=16'd0;
+            min_range=16'hFFFF; max_range=16'd0;
+            min_dop=16'h7FFF; max_dop=-16'h7FFF;
+            num_pts_r=6'd0;
+        end
+    endtask
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || reg_soft_reset || reg_uart_flush) begin
+            parse_state <= S_M0; hdr_byte_cnt <= 4'd0;
+            num_detected_obj <= 0; num_tlvs <= 0;
+            tlv_type <= 0; tlv_len <= 0; tlv_bytes_left <= 0;
+            point_byte_cnt <= 0;
+            frame_valid_r <= 1'b0; parse_err_r <= 1'b0;
+            frame_count_r <= 32'd0; feat_compute_req <= 1'b0;
+            reset_frame_acc;
+        end else begin
+            feat_compute_req <= 1'b0;
+            if (uart_byte_valid) begin
+                case (parse_state)
+                    S_M0: parse_state <= (uart_byte_out==MAGIC0) ? S_M1 : S_M0;
+                    S_M1: parse_state <= (uart_byte_out==MAGIC1) ? S_M2 : S_M0;
+                    S_M2: parse_state <= (uart_byte_out==MAGIC2) ? S_M3 : S_M0;
+                    S_M3: parse_state <= (uart_byte_out==MAGIC3) ? S_M4 : S_M0;
+                    S_M4: parse_state <= (uart_byte_out==MAGIC4) ? S_M5 : S_M0;
+                    S_M5: parse_state <= (uart_byte_out==MAGIC5) ? S_M6 : S_M0;
+                    S_M6: parse_state <= (uart_byte_out==MAGIC6) ? S_M7 : S_M0;
+                    S_M7: begin
+                        if (uart_byte_out==MAGIC7) begin
+                            parse_state <= S_HDR_VER; hdr_byte_cnt <= 0;
+                            reset_frame_acc;
+                        end else parse_state <= S_M0;
+                    end
+                    S_HDR_VER,  S_HDR_VER+1,  S_HDR_VER+2:  parse_state <= parse_state+1;
+                    S_HDR_VER+3:                              parse_state <= S_HDR_PKT;
+                    S_HDR_PKT,  S_HDR_PKT+1,  S_HDR_PKT+2:  parse_state <= parse_state+1;
+                    S_HDR_PKT+3:                              parse_state <= S_HDR_PLAT;
+                    S_HDR_PLAT, S_HDR_PLAT+1, S_HDR_PLAT+2: parse_state <= parse_state+1;
+                    S_HDR_PLAT+3:                             parse_state <= S_HDR_FNO;
+                    S_HDR_FNO,  S_HDR_FNO+1,  S_HDR_FNO+2:  parse_state <= parse_state+1;
+                    S_HDR_FNO+3:                              parse_state <= S_HDR_TIME;
+                    S_HDR_TIME, S_HDR_TIME+1,  S_HDR_TIME+2: parse_state <= parse_state+1;
+                    S_HDR_TIME+3:                             parse_state <= S_HDR_NOBJ;
+                    S_HDR_NOBJ:   begin num_detected_obj[7:0]  <= uart_byte_out; parse_state <= S_HDR_NOBJ+1; end
+                    S_HDR_NOBJ+1: begin num_detected_obj[15:8] <= uart_byte_out; parse_state <= S_HDR_NOBJ+2; end
+                    S_HDR_NOBJ+2, S_HDR_NOBJ+3: parse_state <= parse_state+1;
+                    S_HDR_NTLV:   begin num_tlvs <= uart_byte_out; parse_state <= S_HDR_NTLV+1; end
+                    S_HDR_NTLV+1, S_HDR_NTLV+2, S_HDR_NTLV+3: parse_state <= parse_state+1;
+                    S_HDR_SUBFNO, S_HDR_SUBFNO+1, S_HDR_SUBFNO+2: parse_state <= parse_state+1;
+                    S_HDR_SUBFNO+3: parse_state <= (num_tlvs>0) ? S_TLV_TYPE : S_DONE;
+                    S_TLV_TYPE:   begin tlv_type <= uart_byte_out; parse_state <= S_TLV_TYPE+1; end
+                    S_TLV_TYPE+1, S_TLV_TYPE+2, S_TLV_TYPE+3: parse_state <= parse_state+1;
+                    S_TLV_LEN:    begin tlv_len[7:0]  <= uart_byte_out; parse_state <= S_TLV_LEN+1; end
+                    S_TLV_LEN+1:  begin tlv_len[15:8] <= uart_byte_out; parse_state <= S_TLV_LEN+2; end
+                    S_TLV_LEN+2, S_TLV_LEN+3: begin
+                        if (parse_state==S_TLV_LEN+3) begin
+                            tlv_bytes_left <= tlv_len; point_byte_cnt <= 0;
+                            parse_state <= S_TLV_PAY;
+                        end else parse_state <= parse_state+1;
+                    end
+                    S_TLV_PAY: begin
+                        if (tlv_bytes_left == 16'd0) begin
+                            parse_state <= (num_tlvs > 8'd1) ? S_TLV_TYPE : S_DONE;
+                            if (num_tlvs > 0) num_tlvs <= num_tlvs - 1;
+                        end else begin
+                            tlv_bytes_left <= tlv_bytes_left - 1;
+                            if (tlv_type == 8'd1) begin
+                                case (point_byte_cnt)
+                                    4'd0:  pt_range_idx[7:0]  <= uart_byte_out;
+                                    4'd1:  pt_range_idx[15:8] <= uart_byte_out;
+                                    4'd2:  pt_doppler[7:0]    <= uart_byte_out;
+                                    4'd3:  pt_doppler[15:8]   <= uart_byte_out;
+                                    4'd4:  pt_peak[7:0]        <= uart_byte_out;
+                                    4'd5:  pt_peak[15:8]       <= uart_byte_out;
+                                    4'd6:  pt_x[7:0]           <= uart_byte_out;
+                                    4'd7:  pt_x[15:8]          <= uart_byte_out;
+                                    4'd8:  pt_y[7:0]           <= uart_byte_out;
+                                    4'd9:  pt_y[15:8]          <= uart_byte_out;
+                                    4'd10: pt_z[7:0]           <= uart_byte_out;
+                                    4'd11: pt_z[15:8]          <= uart_byte_out;
+                                    4'd12: pt_range_cm_lo[7:0] <= uart_byte_out;
+                                    4'd13: pt_range_cm_lo[15:8]<= uart_byte_out;
+                                    4'd14: pt_range_cm_hi[7:0] <= uart_byte_out;
+                                    4'd15: begin
+                                        pt_range_cm_hi[15:8] <= uart_byte_out;
+                                        if (pt_range_cm_lo >= 16'd30 && pt_range_cm_lo <= 16'd2000
+                                            && pt_peak >= 16'd5) begin
+                                            acc_n     <= acc_n + 1;
+                                            acc_x     <= acc_x + {{32{pt_x[15]}}, pt_x};
+                                            acc_y     <= acc_y + {{32{pt_y[15]}}, pt_y};
+                                            acc_z     <= acc_z + {{32{pt_z[15]}}, pt_z};
+                                            acc_z2    <= acc_z2 + {16'd0,
+                                                ($unsigned(pt_z[15]?(~pt_z+1):pt_z) *
+                                                 $unsigned(pt_z[15]?(~pt_z+1):pt_z))};
+                                            acc_snr   <= acc_snr   + {32'd0, pt_peak};
+                                            acc_range <= acc_range + {32'd0, pt_range_cm_lo};
+                                            if (pt_z > 16'd6) acc_above_z <= acc_above_z + 1;
+                                            if (pt_x < min_x) min_x <= pt_x;
+                                            if (pt_x > max_x) max_x <= pt_x;
+                                            if (pt_y < min_y) min_y <= pt_y;
+                                            if (pt_y > max_y) max_y <= pt_y;
+                                            if (pt_z < min_z) min_z <= pt_z;
+                                            if (pt_z > max_z) max_z <= pt_z;
+                                            if (pt_peak < min_snr) min_snr <= pt_peak;
+                                            if (pt_peak > max_snr) max_snr <= pt_peak;
+                                            if (pt_range_cm_lo < min_range) min_range <= pt_range_cm_lo;
+                                            if (pt_range_cm_lo > max_range) max_range <= pt_range_cm_lo;
+                                            if (pt_doppler < min_dop) min_dop <= pt_doppler;
+                                            if (pt_doppler > max_dop) max_dop <= pt_doppler;
+                                        end
+                                    end
+                                endcase
+                                point_byte_cnt <= (point_byte_cnt==4'd15) ? 4'd0 : point_byte_cnt+1;
+                            end
+                        end
+                    end
+                    S_DONE: begin
+                        frame_count_r    <= frame_count_r + 1;
+                        frame_valid_r    <= 1'b1;
+                        num_pts_r        <= (acc_n > 32'd63) ? 6'd63 : acc_n[5:0];
+                        feat_compute_req <= 1'b1;
+                        parse_state      <= S_M0;
+                    end
+                    default: parse_state <= S_M0;
+                endcase
+            end
+        end
+    end
+
+    // =========================================================================
+    // SECTION 7: Feature Computation Engine
+    // =========================================================================
+    function [31:0] sqrt_32;
+        input [31:0] x; integer i;
+        reg [31:0] root, remainder, trial;
+        begin
+            root=0; remainder=0;
+            for (i=15; i>=0; i=i-1) begin
+                remainder = {remainder[29:0], x[2*i+1], x[2*i]};
+                trial = {root[30:0], 1'b1};
+                if (remainder >= trial) begin remainder = remainder - trial; root = {root[30:0],1'b1}; end
+                else root = {root[30:0],1'b0};
+            end
+            sqrt_32 = root;
+        end
+    endfunction
+
+    localparam [7:0] DOPPLER_CMS = 8'd4;
+    reg         feat_compute_active;
+    reg [3:0]   feat_step;
+    reg signed [31:0] fc_z_mean_q, fc_z_std_q, fc_range_q;
+    reg signed [31:0] fc_snr_mean_q, fc_n_pts_q;
+    reg signed [31:0] fc_z_range_q, fc_x_range_q, fc_y_range_q;
+    reg signed [31:0] fc_z_frac_q, fc_nzc_q, fc_szfp_q;
+    reg signed [31:0] fc_bgf_q, fc_hs2_q, fc_stight_q, fc_vsc_q, fc_vel_cms_q;
+    reg [47:0]         fc_variance_scaled;
+    reg [31:0]         fc_z_std_raw;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || reg_soft_reset) begin
+            feat_compute_active <= 1'b0; feat_step <= 0;
+        end else if (feat_compute_req && !feat_compute_active) begin
+            feat_compute_active <= 1'b1; feat_step <= 0;
+        end else if (feat_compute_active) begin
+            case (feat_step)
+            4'd0: begin
+                if (acc_n > 0) begin
+                    fc_z_mean_q   <= $signed(acc_z[31:0])   / $signed(acc_n[15:0]);
+                    fc_range_q    <= $signed(acc_range[31:0])/ $signed(acc_n[15:0]);
+                    fc_snr_mean_q <= $signed(acc_snr[31:0]) / $signed(acc_n[15:0]);
+                    fc_n_pts_q    <= $signed(acc_n[15:0]) <<< 16;
+                    fc_z_range_q  <= $signed({16'd0,max_z}) - $signed({16'd0,min_z});
+                    fc_x_range_q  <= $signed({16'd0,max_x}) - $signed({16'd0,min_x});
+                    fc_y_range_q  <= $signed({16'd0,max_y}) - $signed({16'd0,min_y});
+                    fc_variance_scaled <= ((acc_z2[47:0] <<< 8) / acc_n) -
+                        ({32'd0,($signed(acc_z[31:0])/$signed(acc_n[15:0]))} *
+                         {32'd0,($signed(acc_z[31:0])/$signed(acc_n[15:0]))});
+                end else begin
+                    fc_z_mean_q<=0; fc_range_q<=0; fc_snr_mean_q<=0;
+                    fc_n_pts_q<=0; fc_z_range_q<=0; fc_x_range_q<=0;
+                    fc_y_range_q<=0; fc_variance_scaled<=0;
+                end
+                feat_step <= 4'd1;
+            end
+            4'd1: begin
+                fc_z_std_raw  <= sqrt_32(fc_variance_scaled[31:0]);
+                fc_z_frac_q   <= (acc_n>0) ? ($signed(acc_above_z[31:0])<<<16)/$signed(acc_n[15:0]) : 32'd0;
+                fc_nzc_q      <= (fc_range_q!=0) ? (fc_z_mean_q<<<8)/fc_range_q : 32'd0;
+                if (fc_variance_scaled > 0)
+                    fc_vsc_q <= sqrt_32(fc_variance_scaled[31:0]) << 8;
+                else fc_vsc_q <= 0;
+                feat_step <= 4'd2;
+            end
+            4'd2: begin
+                fc_z_std_q    <= $signed(fc_z_std_raw) <<< 12;
+                fc_szfp_q     <= (fc_snr_mean_q * fc_z_frac_q) >>> 16;
+                fc_bgf_q      <= (fc_z_mean_q < 32'd3277) ? 32'd65536 : 32'd0;
+                fc_vel_cms_q  <= ($signed(max_dop)-$signed(min_dop)) * $signed({24'd0,DOPPLER_CMS});
+                feat_step <= 4'd3;
+            end
+            4'd3: begin
+                begin : hs2_blk
+                    reg [31:0] zm_dev;
+                    zm_dev = (fc_z_mean_q > 32'd6554) ?
+                              fc_z_mean_q - 32'd6554 : 32'd6554 - fc_z_mean_q;
+                    fc_hs2_q <= (zm_dev < 32'd2293) ? 32'd65536 :
+                                (zm_dev < 32'd6554) ? 32'd32768 :
+                                (zm_dev < 32'd16384)? 32'd16384 : 32'd0;
+                end
+                fc_stight_q <= (acc_n < 4 && fc_z_range_q < 32'd1966) ? 32'd3736800 :
+                               (acc_n < 10 && fc_z_range_q < 32'd6554) ? 32'd1310720 :
+                               32'd65536;
+                feat_step <= 4'd4;
+            end
+            4'd4: begin
+                feat[2]  <= fc_z_mean_q <<< 8;
+                feat[5]  <= fc_z_std_q;
+                feat[8]  <= fc_z_range_q <<< 8;
+                feat[20] <= $signed({16'd0,max_snr}) <<< 16;
+                feat[47] <= fc_szfp_q;
+                feat[45] <= fc_nzc_q;
+                feat[56] <= fc_hs2_q;
+                feat[26] <= fc_n_pts_q;
+                feat[43] <= fc_vsc_q;
+                feat[25] <= fc_z_frac_q;
+                feat[48] <= fc_bgf_q;
+                feat[58] <= fc_stight_q;
+                feat[24] <= fc_z_range_q <<< 8;
+                // feat[0] = x_mean (Q16.16) — used by steering engine
+                feat[0]  <= (acc_n>0) ? ($signed(acc_x[31:0])/$signed(acc_n[15:0]))<<<8 : 32'd0;
+                feat[1]  <= (acc_n>0) ? ($signed(acc_y[31:0])/$signed(acc_n[15:0]))<<<8 : 32'd0;
+                feat[13] <= fc_range_q <<< 8;
+                feat[15] <= $signed({16'd0,min_range}) <<< 16;
+                feat[16] <= $signed({16'd0,max_range}) <<< 16;
+                feat[17] <= fc_snr_mean_q <<< 8;
+                feat[19] <= $signed({16'd0,min_snr}) <<< 16;
+                feat[21] <= ($signed({16'd0,max_snr})-$signed({16'd0,min_snr})) <<< 16;
+                feat[3]<=0;feat[4]<=0;feat[6]<=0;feat[7]<=0;feat[9]<=0;feat[10]<=0;
+                feat[11]<=0;feat[12]<=0;feat[14]<=0;feat[18]<=0;feat[22]<=0;feat[23]<=0;
+                feat[27]<=0;feat[28]<=0;feat[29]<=0;feat[30]<=0;feat[31]<=0;feat[32]<=0;
+                feat[33]<=0;feat[34]<=0;feat[35]<=0;feat[36]<=0;feat[37]<=0;feat[38]<=0;
+                feat[39]<=0;feat[40]<=0;feat[41]<=0;feat[42]<=0;feat[44]<=0;feat[46]<=0;
+                feat[49]<=0;feat[50]<=0;feat[51]<=0;feat[52]<=0;feat[53]<=0;feat[54]<=0;
+                feat[55]<=0;feat[57]<=0;
+                reg_range_cm    <= fc_range_q[15:0];
+                reg_obj_vel_cms <= fc_vel_cms_q[15:0];
+                feat_step <= 4'd5;
+            end
+            4'd5: begin feat_compute_active <= 1'b0; feat_step <= 0; end
+            default: begin feat_compute_active <= 1'b0; feat_step <= 0; end
+            endcase
+        end
+    end
+
+    wire ml_auto_start = (feat_step == 4'd5) && reg_auto_infer_en && !reg_busy;
+
+    // =========================================================================
+    // SECTION 8: GBM v5 ML Rule Engine — 4-stage pipeline
+    // =========================================================================
+    reg pipe_s0, pipe_s1, pipe_s2, pipe_s3;
+    reg signed [31:0] lf [0:N_FEATURES-1];
+    reg [15:0] l_range_cm_ml;
+    wire signed [31:0] lz_mean  = lf[2];
+    wire signed [31:0] lz_std   = lf[5];
+    wire signed [31:0] lz_range = lf[8];
+    wire        [31:0] lsnr_max = lf[20];
+    wire signed [31:0] lsnr_zfp = lf[47];
+    wire signed [31:0] lnzc     = lf[45];
+    wire signed [31:0] lhsv2    = lf[56];
+    wire        [31:0] lnpts    = lf[26];
+    wire signed [31:0] lvsc     = lf[43];
+    wire signed [31:0] lzfrac   = lf[25];
+    wire signed [31:0] lbgf     = lf[48];
+    wire signed [31:0] lstt     = lf[58];
+    wire signed [31:0] lzspread = lf[24];
+    reg [17:0] ped_acc_s1, sta_acc_s1, veh_acc_s1;
+    reg [17:0] ped_acc_s2, sta_acc_s2, veh_acc_s2;
+    reg [17:0] ped_acc_s3, sta_acc_s3, veh_acc_s3;
+    reg [15:0] range_cm_s3;
+    integer li;
+    wire ml_start = reg_start_manual || ml_auto_start;
+
+    wire [1:0] winner_cls_w =
+        (ped_acc_s3 >= veh_acc_s3 && ped_acc_s3 >= sta_acc_s3) ? 2'd0 :
+        (veh_acc_s3 >= sta_acc_s3)                              ? 2'd2 : 2'd1;
+    wire [17:0] winner_score_w =
+        (winner_cls_w==2'd0) ? ped_acc_s3 :
+        (winner_cls_w==2'd2) ? veh_acc_s3 : sta_acc_s3;
+    wire [31:0] total_s3_w   = {14'h0,ped_acc_s3}+{14'h0,sta_acc_s3}+{14'h0,veh_acc_s3};
+    wire [31:0] conf_full_w  = (total_s3_w>0) ?
+                               (({14'h0,winner_score_w}*32'd100)/total_s3_w) : 32'd0;
+    wire [6:0]  conf_out_w   = (conf_full_w>32'd100) ? 7'd100 : conf_full_w[6:0];
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || reg_soft_reset) begin
+            pipe_s0<=0; pipe_s1<=0; pipe_s2<=0; pipe_s3<=0;
+            reg_busy<=0; reg_done<=0; reg_valid<=0; reg_alert<=0;
+            reg_alert_class<=2'd3; reg_irq_status<=2'b00;
+            reg_class_out<=2'd3; reg_confidence<=7'd0;
+            reg_score_ped<=0; reg_score_sta<=0; reg_score_veh<=0;
+            ped_acc_s1<=0; sta_acc_s1<=0; veh_acc_s1<=0;
+            ped_acc_s2<=0; sta_acc_s2<=0; veh_acc_s2<=0;
+            ped_acc_s3<=0; sta_acc_s3<=0; veh_acc_s3<=0;
+            range_cm_s3<=0;
+            for (li=0; li<N_FEATURES; li=li+1) lf[li] <= 32'd0;
+        end else begin
+            pipe_s0 <= 1'b0;
+            if (ml_start && !reg_busy) begin
+                for (li=0; li<N_FEATURES; li=li+1) lf[li] <= feat[li];
+                l_range_cm_ml <= reg_range_cm;
+                pipe_s0 <= 1'b1; reg_busy <= 1'b1; reg_done <= 1'b0; reg_valid <= 1'b0;
+            end
+            pipe_s1 <= pipe_s0;
+            if (pipe_s0) begin
+                ped_acc_s1 <=
+                    (($signed(lz_std)  > TH_Z_STD_0p07)                               ?18'd1488:18'd0)+
+                    (($signed(lnzc)    > TH_NZC_0p15)                                  ?18'd1068:18'd0)+
+                    (($signed(lnzc)    > TH_NZC_0p31)                                  ?18'd600 :18'd0)+
+                    (($signed(lz_mean) >= TH_Z_MEAN_0p3 && $signed(lz_mean)<=TH_Z_MEAN_2p1)?18'd940:18'd0)+
+                    (($signed(lz_mean) >= TH_Z_MEAN_0p5 && $signed(lz_mean)<=TH_Z_MEAN_1p1)?18'd400:18'd0)+
+                    (($signed(lzspread)> TH_ZSPREAD_0p23)                              ?18'd790 :18'd0)+
+                    (($signed(lsnr_zfp)> TH_SZFP_19)                                  ?18'd785 :18'd0)+
+                    (($signed(lsnr_zfp)> TH_SZFP_18)                                  ?18'd300 :18'd0)+
+                    (($signed(lhsv2)   > TH_HS2_LOW)                                  ?18'd723 :18'd0)+
+                    (($signed(lhsv2)   > TH_HS2_HIGH)                                 ?18'd300 :18'd0)+
+                    (($signed(lbgf)    < TH_BGF_0p5)                                  ?18'd786 :18'd0)+
+                    (($signed(lz_range)> TH_Z_RANGE_0p18 && $signed(lz_range)<TH_Z_RANGE_2p5)?18'd562:18'd0)+
+                    ((lsnr_max         < TH_SNR_MAX_15)                                ?18'd480 :18'd0)+
+                    (($signed(lzfrac)  > TH_ZFRAC_0p5)                                ?18'd285 :18'd0)+
+                    ((lnpts>=TH_NPTS_3 && lnpts<=TH_NPTS_64)                          ?18'd292 :18'd0)+
+                    (($signed(lvsc)    < TH_VSC_LOW)                                  ?18'd250 :18'd0);
+                veh_acc_s1 <=
+                    (($signed(lz_mean) < TH_Z_MEAN_0p3)                               ?18'd940 :18'd0)+
+                    (($signed(lbgf)    >= TH_BGF_0p5)                                 ?18'd1200:18'd0)+
+                    (($signed(lz_std)  < TH_Z_STD_0p07)                               ?18'd1000:18'd0)+
+                    (($signed(lnzc)    < TH_NZC_0p10)                                 ?18'd800 :18'd0)+
+                    (($signed(lzfrac)  < TH_ZFRAC_0p5)                                ?18'd600 :18'd0)+
+                    (($signed(lvsc)    > TH_VSC_HIGH)                                 ?18'd551 :18'd0)+
+                    (($signed(lsnr_zfp)< TH_SZFP_12)                                  ?18'd400 :18'd0)+
+                    ((lsnr_max         > TH_SNR_MAX_15)                                ?18'd480 :18'd0)+
+                    (($signed(lz_range)< TH_Z_RANGE_0p18)                             ?18'd562 :18'd0)+
+                    ((lnpts            > TH_NPTS_12)                                   ?18'd292 :18'd0);
+                sta_acc_s1 <=
+                    (($signed(lz_std)  < TH_Z_STD_0p05)                               ?18'd1200:18'd0)+
+                    (($signed(lz_range)< TH_Z_RANGE_0p18)                             ?18'd1000:18'd0)+
+                    ((lnpts            < TH_NPTS_3)                                    ?18'd900 :18'd0)+
+                    (($signed(lzfrac)  > TH_ZFRAC_0p99 && lnpts<TH_NPTS_3)           ?18'd600 :18'd0)+
+                    (($signed(lnzc)    < TH_NZC_0p15)                                 ?18'd400 :18'd0)+
+                    (($signed(lsnr_zfp)< TH_SZFP_12)                                  ?18'd300 :18'd0)+
+                    (($signed(lstt)    > TH_STT_57)                                   ?18'd388 :18'd0)+
+                    (($signed(lstt)    > TH_STT_71)                                   ?18'd150 :18'd0);
+            end
+            pipe_s2 <= pipe_s1;
+            if (pipe_s1) begin ped_acc_s2<=ped_acc_s1; sta_acc_s2<=sta_acc_s1; veh_acc_s2<=veh_acc_s1; end
+            pipe_s3 <= pipe_s2;
+            if (pipe_s2) begin
+                ped_acc_s3<=ped_acc_s2; sta_acc_s3<=sta_acc_s2; veh_acc_s3<=veh_acc_s2;
+                range_cm_s3<=l_range_cm_ml;
+            end
+            if (reg_irq_clear_valid)
+                reg_irq_status <= reg_irq_status & ~reg_irq_clear_req;
+            if (pipe_s3) begin
+                reg_class_out  <= winner_cls_w;
+                reg_confidence <= conf_out_w;
+                reg_score_ped  <= ped_acc_s3[17:2];
+                reg_score_sta  <= sta_acc_s3[17:2];
+                reg_score_veh  <= veh_acc_s3[17:2];
+                reg_alert      <= 1'b0; reg_alert_class <= 2'd3;
+                case (winner_cls_w)
+                    2'd0: if (range_cm_s3 < reg_thresh_ped) begin reg_alert<=1'b1; reg_alert_class<=2'd0; end
+                    2'd2: if (range_cm_s3 < reg_thresh_veh) begin reg_alert<=1'b1; reg_alert_class<=2'd2; end
+                    2'd1: if (range_cm_s3 < reg_thresh_sta) begin reg_alert<=1'b1; reg_alert_class<=2'd1; end
+                    default: ;
+                endcase
+                reg_done  <= 1'b1; reg_valid <= 1'b1; reg_busy <= 1'b0;
+                reg_irq_status[0] <= 1'b1;
+                reg_irq_status[1] <=
+                    (range_cm_s3 < reg_thresh_ped && winner_cls_w==2'd0) ||
+                    (range_cm_s3 < reg_thresh_veh && winner_cls_w==2'd2) ||
+                    (range_cm_s3 < reg_thresh_sta && winner_cls_w==2'd1);
+            end else begin
+                if (!reg_busy) reg_done <= 1'b0;
+            end
+        end
+    end
+
+    // =========================================================================
+    // SECTION 9: Hall Sensor RPM Meter
+    // =========================================================================
+    reg [9:0] hall_db_cnt; reg hall_stable, hall_prev;
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin hall_db_cnt<=0; hall_stable<=1'b1; hall_prev<=1'b1; end
+        else begin
+            hall_prev <= hall_stable;
+            if (hall_in == hall_stable) hall_db_cnt <= 0;
+            else begin
+                hall_db_cnt <= hall_db_cnt + 1;
+                if (hall_db_cnt == 10'd999) begin hall_stable <= hall_in; hall_db_cnt <= 0; end
+            end
+        end
+    end
+    wire hall_pulse = hall_stable && !hall_prev;
+    reg [26:0] sec_cnt; reg [15:0] pulse_acc; reg [15:0] rpm_reg;
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin sec_cnt<=0; pulse_acc<=0; rpm_reg<=0; end
+        else begin
+            if (hall_pulse) pulse_acc <= pulse_acc + 1;
+            if (sec_cnt == CLK_HZ-1) begin
+                rpm_reg   <= ({16'd0,pulse_acc}*16'd60 > 32'd65535) ? 16'hFFFF : pulse_acc*16'd60;
+                pulse_acc <= 0; sec_cnt <= 0;
+            end else sec_cnt <= sec_cnt + 1;
+        end
+    end
+
+    // =========================================================================
+    // SECTION 10: Velocity-Aware Base PWM Duty Computation
+    // =========================================================================
+    reg is_idle_r, is_moving_r, alert_active_r;
+    reg [12:0] base_duty;
+
+    wire obj_approaching = reg_obj_vel_cms[15] && (reg_obj_vel_cms[14:0] > 15'd50);
+    wire [16:0] manual_counts_w = {9'd0, reg_pwm_manual_duty} * 17'd50;
+    wire [12:0] manual_duty_w   = (manual_counts_w > 17'd5000) ? 13'd5000 : manual_counts_w[12:0];
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            is_idle_r<=1'b1; is_moving_r<=1'b0;
+            base_duty<=DUTY_100; alert_active_r<=1'b0;
+        end else begin
+            is_idle_r      <= (rpm_reg < reg_rpm_idle_thr);
+            is_moving_r    <= (rpm_reg >= reg_rpm_move_thr);
+            alert_active_r <= reg_done && reg_alert;
+            if (!reg_pwm_force_manual) begin
+                if (rpm_reg >= reg_rpm_move_thr) begin
+                    if      (reg_range_cm > RANGE_7M) base_duty <= DUTY_100;
+                    else if (reg_range_cm > RANGE_5M) base_duty <= obj_approaching ? DUTY_20 : DUTY_50;
+                    else if (reg_range_cm > RANGE_3M) base_duty <= obj_approaching ? DUTY_20 : DUTY_50;
+                    else                              base_duty <= DUTY_20;
+                end else if (rpm_reg < reg_rpm_idle_thr)
+                    base_duty <= DUTY_0;
+            end else begin
+                base_duty <= manual_duty_w;
+            end
+        end
+    end
+
+    // =========================================================================
+    // SECTION 11: Lane-Change Steering State Machine (NEW in v3.0)
+    //
+    //  Uses feat[0] = x_mean (Q16.16, metres) from the feature engine.
+    //
+    //  x_mean < −TH_STEER_SOFT → object to the LEFT  → steer RIGHT
+    //                              (reduce LEFT motor duty during TURN phase)
+    //  x_mean > +TH_STEER_SOFT → object to the RIGHT → steer LEFT
+    //                              (reduce RIGHT motor duty during TURN phase)
+    //
+    //  State sequence:
+    //    LC_STRAIGHT → (new alert with x_mean outside center band)
+    //    → LC_TURN (TURN_DURATION clocks, reduced duty on turn side)
+    //    → LC_HOLD (HOLD_DURATION clocks, both sides full speed)
+    //    → LC_CORRECT (CORRECT_DURATION clocks, reduced duty on OPPOSITE side)
+    //    → LC_DONE → LC_STRAIGHT
+    //
+    //  A new alert will NOT interrupt an in-progress lane change. The vehicle
+    //  must complete the sequence to prevent oscillation.
+    //
+    //  steer_dir_r: 0 = turn LEFT (reduce right motor)
+    //               1 = turn RIGHT (reduce left motor)
+    //  steer_state_r: readable by firmware 0=straight 1=left 2=right
+    // =========================================================================
+    wire signed [31:0] x_mean_live = feat[0];
+    wire signed [31:0] x_mean_abs  = x_mean_live[31] ? (~x_mean_live + 1) : x_mean_live;
+    wire               object_right = (x_mean_live > $signed({16'd0, reg_steer_soft_thr}));
+    wire               object_left  = (x_mean_live < -$signed({16'd0, reg_steer_soft_thr}));
+    wire               hard_steer   = (x_mean_abs  > $signed({16'd0, reg_steer_hard_thr}));
+
+    // Duty reduction for turn: 20% (soft) or 40% (hard)
+    wire [12:0] turn_reduce_soft = 13'd1000;  // 20% of 5000
+    wire [12:0] turn_reduce_hard = 13'd2000;  // 40% of 5000
+    // latched at start of lane change
+    reg [12:0] lc_reduce;
+
+    reg [2:0]  lc_state_r;
+    reg        steer_dir_r;    // 0=turning left, 1=turning right
+    reg [1:0]  steer_state_r;  // 0=straight 1=steer_L 2=steer_R (for firmware)
+    reg [31:0] lc_timer;
+
+    // Corrective turn uses opposite direction
+    // TURN:    reduce  steer_dir side
+    // CORRECT: reduce ~steer_dir side
+    wire [12:0] duty_left_lc =
+        (lc_state_r == LC_TURN    &&  steer_dir_r == 1'b0 && base_duty > lc_reduce) ? (base_duty - lc_reduce) :
+        (lc_state_r == LC_CORRECT &&  steer_dir_r == 1'b1 && base_duty > lc_reduce) ? (base_duty - lc_reduce) :
+        base_duty;
+
+    wire [12:0] duty_right_lc =
+        (lc_state_r == LC_TURN    &&  steer_dir_r == 1'b1 && base_duty > lc_reduce) ? (base_duty - lc_reduce) :
+        (lc_state_r == LC_CORRECT &&  steer_dir_r == 1'b0 && base_duty > lc_reduce) ? (base_duty - lc_reduce) :
+        base_duty;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || reg_soft_reset) begin
+            lc_state_r    <= LC_STRAIGHT;
+            steer_dir_r   <= 1'b0;
+            steer_state_r <= 2'b00;
+            lc_timer      <= 32'd0;
+            lc_reduce     <= 13'd0;
+        end else begin
+            case (lc_state_r)
+
+                LC_STRAIGHT: begin
+                    steer_state_r <= 2'b00;
+                    // Only start a lane change when:
+                    //   1. Alert is active (object within threshold)
+                    //   2. Vehicle is moving
+                    //   3. Object is not centred (outside center band)
+                    if (reg_done && reg_alert && is_moving_r &&
+                        (object_right || object_left)) begin
+                        // Determine turn direction and intensity
+                        steer_dir_r <= object_right ? 1'b0 : 1'b1;
+                        lc_reduce   <= hard_steer ? turn_reduce_hard : turn_reduce_soft;
+                        lc_timer    <= TURN_DURATION;
+                        lc_state_r  <= LC_TURN;
+                        steer_state_r <= object_right ? 2'd1 : 2'd2;
+                    end
+                end
+
+                LC_TURN: begin
+                    // Count down TURN_DURATION, then move to HOLD
+                    if (lc_timer > 0) begin
+                        lc_timer <= lc_timer - 1;
+                    end else begin
+                        lc_timer   <= HOLD_DURATION;
+                        lc_state_r <= LC_HOLD;
+                        steer_state_r <= 2'b00;
+                    end
+                end
+
+                LC_HOLD: begin
+                    // Brief straight phase before corrective steer
+                    if (lc_timer > 0) begin
+                        lc_timer <= lc_timer - 1;
+                    end else begin
+                        lc_timer   <= CORRECT_DURATION;
+                        lc_state_r <= LC_CORRECT;
+                        // Corrective steer is opposite to the turn
+                        steer_state_r <= steer_dir_r ? 2'd1 : 2'd2;
+                    end
+                end
+
+                LC_CORRECT: begin
+                    // Reduce opposite side to re-centre vehicle
+                    if (lc_timer > 0) begin
+                        lc_timer <= lc_timer - 1;
+                    end else begin
+                        lc_state_r    <= LC_DONE;
+                        steer_state_r <= 2'b00;
+                    end
+                end
+
+                LC_DONE: begin
+                    // Lane change complete — return to straight
+                    steer_state_r <= 2'b00;
+                    lc_state_r    <= LC_STRAIGHT;
+                    lc_timer      <= 32'd0;
+                end
+
+                default: lc_state_r <= LC_STRAIGHT;
+            endcase
+        end
+    end
+
+    // =========================================================================
+    // SECTION 12: Dual 20 kHz PWM Generators (with lane-change duty)
+    // =========================================================================
+    reg [12:0] pwm_cnt;
+    reg        pwm_l_out_r, pwm_r_out_r;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            pwm_cnt <= 0; pwm_l_out_r <= 0; pwm_r_out_r <= 0;
+        end else begin
+            pwm_cnt     <= (pwm_cnt >= PWM_PERIOD-1) ? 13'd0 : pwm_cnt+1;
+            pwm_l_out_r <= reg_pwm_en && (pwm_cnt < duty_left_lc);
+            pwm_r_out_r <= reg_pwm_en && (pwm_cnt < duty_right_lc);
+        end
+    end
+
+    // =========================================================================
+    // SECTION 13: L298N Direction Pins (IN1–IN4)
+    //
+    //  Normal forward: IN1=1 IN2=0 IN3=1 IN4=0
+    //  Brake:          IN1=1 IN2=1 IN3=1 IN4=1
+    //  (Reverse not used in normal ADAS operation)
+    //
+    //  Series motor note: both motors on each side share the same H-bridge
+    //  half. At 7.4 V supply, each motor in series receives ~3.7 V at 100%
+    //  duty — sufficient for low-speed campus/warehouse ADAS.
+    // =========================================================================
+    wire brake_active = (base_duty == DUTY_0) && (rpm_reg > 5);
+
+    assign in1 = 1'b1;                        // left  side: always forward
+    assign in2 = brake_active ? 1'b1 : 1'b0; // left  side: brake when idle
+    assign in3 = 1'b1;                        // right side: always forward
+    assign in4 = brake_active ? 1'b1 : 1'b0; // right side: brake when idle
+
+    // =========================================================================
+    // SECTION 14: Buzzer Controller (PWM-driven, patterned)
+    //
+    //  Passive piezo buzzer driven at audio frequency via PWM square wave.
+    //  Pattern gate controls ON/OFF intervals.
+    //
+    //  Zone determination:
+    //    > 7 m  → OFF
+    //    5–7 m  → CONTINUOUS 2 kHz   (50% duty square wave, always gated)
+    //    3–5 m  → DISCRETE   2 kHz   (250 ms ON / 250 ms OFF)
+    //    < 3 m  → RAPID      4 kHz   (100 ms ON / 100 ms OFF)
+    //
+    //  Implementation: buzzer_out is the AND of:
+    //    buzz_tone    (audio frequency square wave)
+    //    pattern_gate (pattern ON/OFF envelope)
+    //
+    //  Using PWM frequency for audio means the FPGA pin toggles at the audio
+    //  frequency directly — the piezo responds to these transitions.
+    // =========================================================================
+    reg [16:0] buzz_cnt;
+    reg [16:0] buzz_half_period;
+    reg        buzz_tone;
+    reg [31:0] pattern_cnt;
+    reg        pattern_gate;
+    reg [1:0]  buzz_zone;
+    reg        buzzer_gated_r;
+
+    // Combinational zone decode
+    always @(*) begin
+        if (reg_range_cm == 0 || !reg_done)
+            buzz_zone = 2'd0;
+        else if (reg_range_cm > RANGE_7M)
+            buzz_zone = 2'd0;
+        else if (reg_range_cm > RANGE_5M)
+            buzz_zone = 2'd1;   // 5-7 m: continuous 2 kHz
+        else if (reg_range_cm > RANGE_3M)
+            buzz_zone = 2'd2;   // 3-5 m: discrete 250ms/250ms
+        else
+            buzz_zone = 2'd3;   // <3 m : rapid 100ms/100ms
+    end
+
+    // Tone generator (audio square wave)
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            buzz_cnt <= 0; buzz_half_period <= BUZZ_HALF_2K; buzz_tone <= 0;
+        end else begin
+            buzz_half_period <= (buzz_zone == 2'd3) ? BUZZ_HALF_4K : BUZZ_HALF_2K;
+            if (buzz_cnt >= buzz_half_period - 1) begin
+                buzz_cnt  <= 0;
+                buzz_tone <= ~buzz_tone;
+            end else
+                buzz_cnt <= buzz_cnt + 1;
+        end
+    end
+
+    // Pattern gate (ON/OFF envelope)
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            pattern_cnt <= 0; pattern_gate <= 1'b0;
+        end else begin
+            case (buzz_zone)
+                2'd0: begin pattern_gate <= 1'b0; pattern_cnt <= 0; end
+                2'd1: begin pattern_gate <= 1'b1; pattern_cnt <= 0; end  // always on
+                2'd2: begin // 250 ms on / 250 ms off
+                    if (pattern_cnt >= BUZZ_DISCRETE_ON + BUZZ_DISCRETE_OFF - 1)
+                        pattern_cnt <= 0;
+                    else
+                        pattern_cnt <= pattern_cnt + 1;
+                    pattern_gate <= (pattern_cnt < BUZZ_DISCRETE_ON);
+                end
+                2'd3: begin // 100 ms on / 100 ms off
+                    if (pattern_cnt >= BUZZ_RAPID_ON + BUZZ_RAPID_OFF - 1)
+                        pattern_cnt <= 0;
+                    else
+                        pattern_cnt <= pattern_cnt + 1;
+                    pattern_gate <= (pattern_cnt < BUZZ_RAPID_ON);
+                end
+                default: begin pattern_gate <= 0; pattern_cnt <= 0; end
+            endcase
+        end
+    end
+
+    // Final buzzer output gate
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn)            buzzer_gated_r <= 1'b0;
+        else if (reg_buzzer_disable)   buzzer_gated_r <= 1'b0;
+        else if (reg_buzzer_force_on)  buzzer_gated_r <= buzz_tone;
+        else                           buzzer_gated_r <= buzz_tone && pattern_gate;
+    end
+
+    // =========================================================================
+    // SECTION 15: Status LED Controller
+    //
+    //  Behaviour:
+    //    Alert active (object inside threshold)  → LED solid ON
+    //    Object detected, outside threshold      → LED blinks at 1 Hz
+    //    No valid detection                      → LED OFF
+    //
+    //  Blink uses a 1 Hz counter (toggle every 50_000_000 clocks at 100 MHz)
+    // =========================================================================
+    reg [31:0] led_blink_cnt;
+    reg        led_blink_r;
+    reg        status_led_r;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) begin
+            led_blink_cnt <= 0; led_blink_r <= 0;
+        end else begin
+            if (led_blink_cnt >= LED_BLINK_HALF - 1) begin
+                led_blink_cnt <= 0;
+                led_blink_r   <= ~led_blink_r;
+            end else
+                led_blink_cnt <= led_blink_cnt + 1;
+        end
+    end
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn) status_led_r <= 1'b0;
+        else if (alert_active_r)
+            status_led_r <= 1'b1;               // solid ON during alert
+        else if (reg_done && !reg_busy && reg_valid)
+            status_led_r <= led_blink_r;        // blink when detected, no alert
+        else
+            status_led_r <= 1'b0;               // off otherwise
+    end
+
+    // =========================================================================
+    // SECTION 16: SPI Master for SD Card (CPOL=0 CPHA=0, up to 4 MHz)
+    // =========================================================================
+    reg [2:0]  spi_bit_cnt;
+    reg [7:0]  spi_shift_tx, spi_shift_rx;
+    reg        spi_busy_r;
+    reg [5:0]  spi_clk_cnt;
+    reg        spi_clk_r, spi_mosi_r;
+
+    always @(posedge s_axi_aclk) begin
+        if (!s_axi_aresetn || !reg_spi_en) begin
+            spi_bit_cnt  <= 0; spi_shift_tx <= 0; spi_shift_rx <= 0;
+            spi_busy_r   <= 0; spi_clk_cnt  <= 0;
+            spi_clk_r    <= 0; spi_mosi_r   <= 1'b1;
+            reg_spi_rx_ready <= 1'b0;
+        end else begin
+            reg_spi_rx_ready <= 1'b0;
+            if (!spi_busy_r && reg_spi_tx_req) begin
+                spi_shift_tx <= reg_spi_tx_data;
+                spi_bit_cnt  <= 3'd7;
+                spi_clk_cnt  <= 0;
+                spi_busy_r   <= 1'b1;
+                spi_mosi_r   <= reg_spi_tx_data[7];
+            end else if (spi_busy_r) begin
+                spi_clk_cnt <= spi_clk_cnt + 1;
+                if (spi_clk_cnt == reg_spi_clk_div - 1) begin
+                    spi_clk_cnt <= 0;
+                    spi_clk_r   <= ~spi_clk_r;
+                    if (!spi_clk_r) begin  // rising edge: sample MISO
+                        spi_shift_rx <= {spi_shift_rx[6:0], sd_miso};
+                        if (spi_bit_cnt == 0) begin
+                            spi_busy_r       <= 1'b0;
+                            spi_clk_r        <= 1'b0;
+                            reg_spi_rx_data  <= {spi_shift_rx[6:0], sd_miso};
+                            reg_spi_rx_ready <= 1'b1;
+                        end else begin
+                            spi_bit_cnt <= spi_bit_cnt - 1;
+                            spi_mosi_r  <= spi_shift_tx[spi_bit_cnt - 1];
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    // =========================================================================
+    // SECTION 17: Output Assignments
+    // =========================================================================
+    assign pwm_l_out   = pwm_l_out_r;
+    assign pwm_r_out   = pwm_r_out_r;
+    assign buzzer_out  = buzzer_gated_r;
+    assign status_led  = status_led_r;
+    assign irq_out     = |(reg_irq_status & reg_irq_enable);
+    assign sd_sclk     = spi_clk_r;
+    assign sd_mosi     = spi_mosi_r;
+    assign sd_cs_n     = reg_spi_cs_n;
+
+endmodule
+
+`default_nettype wire
